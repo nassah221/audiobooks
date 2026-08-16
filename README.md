@@ -219,6 +219,30 @@ Keep those invariants in mind when you edit: changing inputs or generation
 details must change the fingerprint, and never post-process the saved
 sentence audio.
 
+## Performance experiments (benchmark-only, nothing enabled)
+
+`audiobook/perf.py` is an opt-in benchmark/profiling harness that compares the
+frozen sequential generation against two *unadopted* speedups. **Neither is
+enabled in production** — they only run here, in isolated fresh subprocesses,
+writing under `outputs/perf` (gitignored):
+
+- **speaker-cache** (default): caches the canonical reference speaker
+  embedding instead of re-extracting it every sentence.
+- **batch2 / batch4**: Qwen `batch_generate` with a shared reference. This is
+  **output-changing** (it forces `repetition_penalty >= 1.5` and a per-seq
+  max-token cap) and only runs with `--accept-output-changing`.
+
+```sh
+uv run python -m audiobook.perf profile          # measure phase timings
+uv run python -m audiobook.perf benchmark        # baseline vs speaker-cache
+uv run python -m audiobook.perf benchmark --include-batch --accept-output-changing
+```
+
+Qwen has no seed, so percentages are indicative only; objective structure and
+persistent-ASR gates plus blind human A/B samples are required before any
+adoption. This tool never touches production state, output, or generation
+defaults.
+
 ## Commands at a glance
 
 ```sh
