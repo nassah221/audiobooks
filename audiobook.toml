@@ -1,0 +1,24 @@
+# Audiobook pipeline configuration. This file is the single source of truth
+# for every run input; paths are relative to this file's directory (the repo
+# root). All values below are the approved defaults — see README before
+# editing anything.
+
+[book]
+path = "books/after-tamerlane.epub"
+sha256 = "6bd149b6165949de3d21a856746f399dc5bc402fac8a3a6dea7da05ffc79e99a"
+
+[voice]
+audio = "references/bragg/phrase-bounded.wav"
+audio_sha256 = "049da42567943665ec11b4765b60b041ebf8280931b9e1cfcb16d8062486ee3e"
+transcript = "references/bragg/phrase-bounded.txt"
+transcript_sha256 = "2c809033e939cb4cba4db00d121305daf23e92831f126578829606c805693cf8"
+
+[model]
+repo = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
+revision = "a6eb4f68e4b056f1215157bb696209bc82a6db48"
+language = "English"
+max_tokens = 4096
+
+[asr]
+repo = "mlx-community/whisper-tiny"
+revision = "78c52ab98ca87f570bc57ad852e15ef7060f9f76"

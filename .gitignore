@@ -1,0 +1,31 @@
+# Python environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Runtime state: outputs, manifests, caches, model weights
+outputs/
+manifests/
+.cache/
+models/
+
+# Legacy F5 experiment scripts — never committed
+scripts/
+
+# Alternate transcripts are unneeded; only the canonical phrase-bounded.txt is tracked
+references/bragg/alternates/
+
+# Copyrighted inputs and generated audio stay local — never committed
+*.epub
+*.wav
+*.m4a
+*.m4b
+*.flac
+
+# Tiny checked test fixtures only (keep them small):
+!tests/fixtures/**/*.wav
+!tests/fixtures/**/*.m4a
+!tests/fixtures/**/*.flac
