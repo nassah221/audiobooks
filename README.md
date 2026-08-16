@@ -116,9 +116,8 @@ uv run audiobook eta
 ```
 
 This reads the measured pilot and the number of sentences, then projects how
-long generation and checking will take. On the target M2 Pro, generation runs
-faster than real time. The estimate is based on your measured run, so it is
-useful — not a generic guess.
+long generation and checking will take on the machine running it. Run
+`preflight` on the M2 Pro first; its measured result is the only reliable ETA.
 
 ## Generate (and keep the Mac awake)
 
