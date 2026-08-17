@@ -21,6 +21,8 @@ references/bragg/alternates/
 # Copyrighted inputs and generated audio stay local — never committed
 *.epub
 *.wav
+# The configured 10-second canonical voice sample is required for reproducible runs.
+!references/bragg/phrase-bounded.wav
 *.m4a
 *.m4b
 *.flac

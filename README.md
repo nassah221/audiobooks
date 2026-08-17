@@ -19,9 +19,9 @@ Everything about the book, the voice, and the model lives in one small file,
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-- The book and the reference audio. These are **copyrighted material for your
-  private use only** — keep them out of git and do not share them. This
-  project is a private pipeline, so it is not set up to be published.
+- The book and any replacement reference audio. Keep copyrighted inputs out of
+  git. The private repository includes only the configured 10-second canonical
+  reference sample and its exact transcript.
 - `ffmpeg` for the final M4B package:
 
 ```sh
@@ -46,8 +46,8 @@ cache (`~/.cache/huggingface` by default). Later runs work offline.
 
 ## Add your book and voice
 
-`uv sync` copies no book and no audio (they are not stored in git). Put yours
-in the project:
+The repository includes the configured canonical reference sample. To use a
+different book or voice, put the replacement files in the project:
 
 ```sh
 cp path/to/your-book.epub books/
@@ -60,9 +60,9 @@ the exact text of what is said in it (the TXT). The tool clones that voice.
 Chapter and book selection is still done on the command line (see Commands),
 not in the config.
 
-> The project ships frozen example hashes for the original book and voice.
-> When you use your own files you must replace those hashes (next step), or
-> `preflight` will refuse to start.
+> The private repository includes the canonical sample and frozen example
+> hashes. When you use your own files, replace those hashes in the next step,
+> or `preflight` will refuse to start.
 
 ## Configure `audiobook.toml`
 
