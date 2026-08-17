@@ -22,6 +22,12 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 - The book and the reference audio. These are **copyrighted material for your
   private use only** — keep them out of git and do not share them. This
   project is a private pipeline, so it is not set up to be published.
+- `ffmpeg` for the final M4B package:
+
+```sh
+brew install ffmpeg
+```
+
 
 ## Setup
 
@@ -75,8 +81,8 @@ the project root.
 | `[model] revision` | Exact model version (leave alone) | `a6eb4f…` |
 | `[model] language` | Language to speak | `English` |
 | `[model] max_tokens` | Max tokens per sentence | `4096` |
-| `[asr] repo` | Model used to check sentences (leave alone) | `mlx-community/whisper-tiny` |
-| `[asr] revision` | Exact ASR model version (leave alone) | `78c52a…` |
+| `[asr] repo` | Model used to check sentences (leave alone) | `mlx-community/whisper-large-v3-turbo` |
+| `[asr] revision` | Exact ASR model version (leave alone) | `a4aae…` |
 
 To fill in the hashes:
 
@@ -144,22 +150,40 @@ Useful flags:
 uv run audiobook validate
 ```
 
-Every generated sentence is checked by an automated speech-recognition
-pass. Sentences that fail are kept (so you do not lose the audio) but marked
-for your review. When *every* planned sentence passes, `validate` itself
-assembles the final `book.wav` by joining the sentence files byte-for-byte
-(exact concatenation, no processing). If any sentence fails, that blocks
-assembly until you deal with it or re-run.
+Every generated sentence is checked by automated speech recognition. The
+strict validator keeps failed sentences for review and records why they
+failed. It assembles `book.wav` only when every planned sentence passes.
+
+For this name-heavy book, Whisper can spell correct speech differently. Apply
+the recorded lexical policy after validation to distinguish those differences
+from clipping, silence, repetition, and other audio defects:
+
+```sh
+uv run python -m audiobook.adjudicate --dry-run
+uv run python -m audiobook.adjudicate --assemble
+```
+
+The first command reports every decision without writing files. The second
+backs up failed sentence WAVs, appends every decision to the ledger, and writes
+`book.lexical-advisory-v1.wav`. It refuses assembly while any structural or
+low-coverage failure remains.
+
+## Package the audiobook
+
+```sh
+uv run python -m audiobook.package
+```
+
+This rebuilds the adjudicated WAV from the current decisions, reads the title,
+author, description, cover, and chapter names from the EPUB, then writes an
+AAC M4B with embedded chapters and cover art. Add `--chapters` to also write
+one PCM16 WAV per chapter.
 
 ## What you get
 
-`preflight`, `generate`, `validate`, and `eta` write into the output folder
-(`outputs/qwen-book` by default): the generated audio, per-sentence notes, the
-validation records, and the timing data. Once every sentence passes
-validation, the chapters are assembled into the final audiobook.
-
-Output audio is saved as PCM16 WAVs — the raw pipeline result, with no
-mastering or post-processing.
+The commands write runtime state, generated audio, validation records, the
+adjudication ledger, and the packaged audiobook under `outputs/qwen-book`.
+That directory and all source books and audio are excluded from git.
 
 ## Copy to the M2 Pro
 
@@ -174,27 +198,28 @@ The target machine is the M2 Pro. To move a finished project there:
 
 ## How it fits together (for tweakers)
 
-The pipeline is five Python files under `src/audiobook/`. The whole flow is:
+The pipeline modules under `src/audiobook/` form this flow:
 
 ```
-audiobook.toml -> config.py -> epub.py -> runner.py -> asr.py -> book.wav
-  book/voice/      reads the     reads the   speaks each   checks each   final
-  model/asr        settings      book text   sentence,     sentence      audiobook
-  settings                       chapters    WAV checkpointed
+audiobook.toml -> config.py -> epub.py -> runner.py -> asr.py
+                                      generation    strict validation
+                                                        |
+                                                        v
+                                               adjudicate.py -> package.py
+                                               recorded policy    M4B
+```
 
 File map:
 
-- `config.py` — reads `audiobook.toml` (stdlib `tomllib`), finds the project
-  root, and holds the settings.
-- `cli.py` — the `audiobook` commands (`preflight`, `eta`, `generate`,
-  `validate`) and their flags.
-- `epub.py` — turns the EPUB into chapter text: extracts, normalizes
-  typography/numbers, splits into sentences.
-- `runner.py` — the core. Loads the model once, and for every sentence
-  generates a WAV, saves it as an atomic checkpoint, and records progress.
-  Also does the measured pilot, ETA math, and chapter assembly.
-- `asr.py` — the speech-recognition pass that checks each sentence and writes
-  PASS/FAIL records.
+- `config.py` reads `audiobook.toml`, finds the project root, and holds the
+  settings.
+- `cli.py` provides the `preflight`, `eta`, `generate`, and `validate` commands.
+- `epub.py` extracts chapter text, normalizes it, and splits it into sentences.
+- `runner.py` generates sentence WAVs, saves atomic checkpoints, and records
+  progress. It also runs the measured pilot and calculates the ETA.
+- `asr.py` checks each sentence and writes strict PASS or FAIL records.
+- `adjudicate.py` records lexical overrides while retaining structural gates.
+- `package.py` writes the chaptered M4B from the current adjudication decisions.
 
 The rules it keeps:
 
@@ -213,6 +238,8 @@ Where to change what:
 - Text cleanup (numbers, punctuation, sentence splitting) → `epub.py`.
 - Sound of generation / checkpoints → `runner.py`.
 - How sentences are verified → `asr.py`.
+- Lexical override policy and assembly → `adjudicate.py`.
+- M4B metadata, cover, and chapter packaging → `package.py`.
 - New or changed commands / flags → `cli.py`.
 
 Keep those invariants in mind when you edit: changing inputs or generation
@@ -246,10 +273,12 @@ defaults.
 ## Commands at a glance
 
 ```sh
-uv run audiobook preflight    # check inputs, hashes, model, env; measure pilot
-uv run audiobook eta          # projected time from the measured pilot
-uv run audiobook generate     # resumable, sentence-by-sentence generation
-uv run audiobook validate     # check each sentence, block final assembly on failures
+uv run audiobook preflight                         # check inputs and measure the pilot
+uv run audiobook eta                               # project time from the measured pilot
+uv run audiobook generate                          # generate resumable sentence WAVs
+uv run audiobook validate                          # record strict ASR decisions
+uv run python -m audiobook.adjudicate --assemble   # record overrides and assemble the WAV
+uv run python -m audiobook.package                 # write the chaptered M4B
 ```
 
 Run any of them with `--help` for the full list of flags.
