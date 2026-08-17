@@ -53,10 +53,12 @@ import time
 from collections import Counter
 
 # --- frozen ASR model (default) ---------------------------------------------
-# whisper-tiny (weights.npz layout): loadable by pinned mlx-whisper 0.4.3,
-# already used for the reference ASR runs. revision == cache refs/main.
-DEFAULT_MODEL_REPO = "mlx-community/whisper-tiny"
-DEFAULT_MODEL_REVISION = "78c52ab98ca87f570bc57ad852e15ef7060f9f76"
+# whisper-large-v3-turbo (weights.safetensors layout): loadable by pinned
+# mlx-whisper 0.4.3. Proper-noun coverage is the deciding factor: whisper-tiny
+# misread "Tamerlane" as "Tamil Nadu" and whisper-small as "Tamilaine",
+# both blocking preflight; large-v3-turbo transcribes it exactly (13/13).
+DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
+DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
 
 # --- verdict thresholds ------------------------------------------------------

@@ -20,5 +20,5 @@ language = "English"
 max_tokens = 4096
 
 [asr]
-repo = "mlx-community/whisper-tiny"
-revision = "78c52ab98ca87f570bc57ad852e15ef7060f9f76"
+repo = "mlx-community/whisper-large-v3-turbo"
+revision = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
