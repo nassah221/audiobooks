@@ -766,26 +766,53 @@ class Generator:
             )
         return self._validator_obj
 
+    @staticmethod
+    def _terminal_cutoff(audio) -> bool:
+        """Return True when speech reaches the generated sample boundary."""
+        import numpy as np
+
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        tail = samples[-int(SAMPLE_RATE * 0.1):]
+        if tail.size == 0 or float(np.sqrt(np.mean(np.square(tail)))) <= 0.05:
+            return False
+        quiet = np.abs(samples) <= 0.01
+        nonquiet = np.flatnonzero(~quiet)
+        trailing_silence = samples.size if nonquiet.size == 0 else samples.size - int(nonquiet[-1]) - 1
+        return trailing_silence < int(SAMPLE_RATE * 0.1)
+
     def _generate(self, chunk: dict, model) -> dict:
         inv = _invocation(self.config)
+        # Unspeakable sentence (no alphabetic content: footnote markers like
+        # '*', em-dashes, ellipses) cannot be spoken by the TTS (it returns
+        # zero results, which would abort the run). Write a short silent
+        # placeholder and mark done so the plan stays intact and generation
+        # continues; the adjudicator omits it from the final book.
+        if not re.search(r"[A-Za-z]", chunk["text"]):
+            return self._silent_placeholder(chunk)
         t0 = time.perf_counter()
-        results = list(model.generate(
-            text=chunk["text"],
-            ref_audio=str(self.ref_wav),
-            ref_text=self.ref_text,
-            lang_code=inv["lang_code"],
-            stream=inv["stream"],
-            max_tokens=inv["max_tokens"],
-        ))
+        for attempt in range(3):
+            results = list(model.generate(
+                text=chunk["text"],
+                ref_audio=str(self.ref_wav),
+                ref_text=self.ref_text,
+                lang_code=inv["lang_code"],
+                stream=inv["stream"],
+                max_tokens=inv["max_tokens"],
+            ))
+            if len(results) != 1:
+                raise RunError(f"{chunk['id']}: generation results = {len(results)}, expected exactly 1")
+            r = results[0]
+            if not self._terminal_cutoff(r.audio):
+                break
+        else:
+            raise RunError(f"{chunk['id']}: speech reaches the sample boundary after 3 attempts")
         gen_seconds = time.perf_counter() - t0
-        if len(results) != 1:
-            raise RunError(f"{chunk['id']}: generation results = {len(results)}, expected exactly 1")
-        r = results[0]
         if int(r.sample_rate) != SAMPLE_RATE:
             raise RunError(f"{chunk['id']}: result sample_rate {r.sample_rate} != {SAMPLE_RATE}")
         import numpy as np
         import soundfile as sf
 
+        audio = np.asarray(r.audio)
         rel = f"chunks/{chunk['chapter']}/{chunk['chapter']}-{chunk['idx']:04d}.wav"
         wav = self.out_dir / rel
         wav.parent.mkdir(parents=True, exist_ok=True)
@@ -793,7 +820,7 @@ class Generator:
         # rename below is the atomic publish step.
         tmp = wav.with_name(wav.name + ".tmp.wav")
         try:
-            sf.write(str(tmp), np.asarray(r.audio), SAMPLE_RATE, subtype="PCM_16")
+            sf.write(str(tmp), audio, SAMPLE_RATE, subtype="PCM_16")
             os.replace(tmp, wav)
         except BaseException:
             if tmp.exists():
@@ -822,6 +849,37 @@ class Generator:
             "reference_wav_sha256": self.ref_wav_sha,
             "reference_text_sha256": self.ref_text_sha,
             "started_unix": time.time(),
+        }
+
+    def _silent_placeholder(self, chunk: dict) -> dict:
+        """Write a short silent PCM16 WAV for an unspeakable sentence and mark
+        it done, so resume/plan stay intact without calling the TTS."""
+        import numpy as np
+        import soundfile as sf
+
+        seconds = 0.3
+        frames = int(round(seconds * SAMPLE_RATE))
+        rel = f"chunks/{chunk['chapter']}/{chunk['chapter']}-{chunk['idx']:04d}.wav"
+        wav = self.out_dir / rel
+        wav.parent.mkdir(parents=True, exist_ok=True)
+        tmp = wav.with_name(wav.name + ".tmp.wav")
+        try:
+            sf.write(str(tmp), np.zeros(frames, dtype=np.int16), SAMPLE_RATE, subtype="PCM_16")
+            os.replace(tmp, wav)
+        except BaseException:
+            if tmp.exists():
+                tmp.unlink()
+            raise
+        return {
+            "id": chunk["id"], "chapter": chunk["chapter"], "idx": chunk["idx"],
+            "text": chunk["text"], "text_sha256": chunk["text_sha256"],
+            "wav": rel, "wav_sha256": sha256_file(wav), "sample_rate": SAMPLE_RATE,
+            "channels": 1, "subtype": "PCM_16", "samples": frames,
+            "seconds": round(frames / SAMPLE_RATE, 4), "generation_seconds": 0.0,
+            "model": {"repo": self.config.model_repo, "revision": self.config.model_revision},
+            "reference_wav_sha256": self.ref_wav_sha,
+            "reference_text_sha256": self.ref_text_sha,
+            "started_unix": time.time(), "unspeakable": True,
         }
 
     def _record_chunk(self, record: dict):
@@ -1346,6 +1404,12 @@ def selfcheck() -> int:
           not Generator._record_ok(dict(_pass, asr={"model_repo": "x", "model_revision": "y"}), "E", "W", _ar, _av))
     check("record_ok rejects empty ASR config",
           not Generator._record_ok(dict(_pass, asr={}), "E", "W", _ar, _av))
+    import numpy as np
+    quiet_tail = np.r_[np.full(SAMPLE_RATE // 5, 0.2, dtype=np.float32),
+                       np.zeros(SAMPLE_RATE // 5, dtype=np.float32)]
+    clipped_tail = np.full(SAMPLE_RATE // 5, 0.2, dtype=np.float32)
+    check("terminal cutoff accepts trailing silence", not Generator._terminal_cutoff(quiet_tail))
+    check("terminal cutoff rejects speech at boundary", Generator._terminal_cutoff(clipped_tail))
 
     header = Generator._wav_header_bytes(6)
     check("wav header RIFF/fmt/data", header[:4] == b"RIFF" and header[8:12] == b"WAVE"
