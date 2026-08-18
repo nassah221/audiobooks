@@ -9,7 +9,7 @@ sha256 = "6bd149b6165949de3d21a856746f399dc5bc402fac8a3a6dea7da05ffc79e99a"
 
 [voice]
 audio = "references/bragg/phrase-bounded.wav"
-audio_sha256 = "049da42567943665ec11b4765b60b041ebf8280931b9e1cfcb16d8062486ee3e"
+audio_sha256 = "b659c0428f2b5a2282437c20d2002409e8b96ee891250129a3da7d250bdc481a"
 transcript = "references/bragg/phrase-bounded.txt"
 transcript_sha256 = "2c809033e939cb4cba4db00d121305daf23e92831f126578829606c805693cf8"
 
