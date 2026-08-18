@@ -28,7 +28,7 @@ Record schema (all values JSON-native):
     transcript, transcript_normalized, asr_tokens,
     confidence: {avg_logprob, no_speech_prob, compression_ratio},
     coverage: {expected_tokens, matched_tokens, fraction, missing},
-    mandatory: {items, missing},
+    mandatory: {items, missing, missing_fragile},
     terminal: {expected, matched},
     repetition: {max_multiplicity, most_repeated, repeated_count}
     leakage: {flagged, detail},
@@ -63,7 +63,7 @@ from collections import Counter
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v7-century-equivalence"
+VALIDATION_POLICY = "paragraph-v8-list-markers"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -74,6 +74,10 @@ REPEAT_MAX_MULTIPLICITY = 3  # same adjacent n-gram (n>=2) seen this many times
 MAX_INTERNAL_GAP_S = 2.5     # internal silence inside a spoken chunk
 MANDATORY_FUZZY_RATIO = 0.8  # token match floor (difflib ratio) for mandatory
 LEAKAGE_OVERLAP_MIN = 0.8    # token overlap with a leakage text that flags
+FRAGILE_NUMBER_DIGITS_MAX = 2  # bare number word (0-99) mandatory items are
+                                # ASR-fragile, not hard-mandatory (see is_fragile_mandatory)
+SHORT_SENTENCE_MAX_WORDS = 2   # sentence_end boundaries closing a sentence
+                                # this short use the colon_semicolon threshold
 
 _NUM_WORDS = {
     "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
@@ -262,8 +266,17 @@ def normalized_word_timings(segments: list) -> list:
 
 
 def _source_punctuation_boundaries(source: str) -> list:
-    """Find punctuation boundaries and their preceding normalized token."""
+    """Find punctuation boundaries and their preceding normalized token.
+
+    Each `sentence_end` boundary also records `sentence_word_count`: the
+    number of tokens in the sentence it closes (since the previous
+    sentence_end boundary, or the start of the source). A one- or two-word
+    sentence -- an enumerated-list marker like "one." -- is read with a
+    shorter pause than ordinary prose, so `punctuation_metrics` relaxes its
+    threshold when this count is low (see SHORT_SENTENCE_MAX_WORDS).
+    """
     boundaries = []
+    prev_sentence_end_index = -1
     for chunk_match in re.finditer(r"\S+", source):
         chunk = chunk_match.group(0)
         chunk_tokens = tokenize(chunk)
@@ -288,11 +301,16 @@ def _source_punctuation_boundaries(source: str) -> list:
                 kind = "comma"
             else:
                 continue
-            boundaries.append({
+            token_index = len(preceding) - 1
+            boundary = {
                 "kind": kind,
                 "punctuation": mark[0],
-                "expected_token_index": len(preceding) - 1,
-            })
+                "expected_token_index": token_index,
+            }
+            if kind == "sentence_end":
+                boundary["sentence_word_count"] = token_index - prev_sentence_end_index
+                prev_sentence_end_index = token_index
+            boundaries.append(boundary)
     return boundaries
 
 
@@ -335,6 +353,12 @@ def punctuation_metrics(source: str, word_timings: list) -> dict:
         if aligned:
             gap = round(float(word_timings[after_asr]["start"]) - float(word_timings[before_asr]["end"]), 4)
         threshold = PUNCTUATION_THRESHOLDS[kind]
+        if (kind == "sentence_end"
+                and boundary.get("sentence_word_count", 0) <= SHORT_SENTENCE_MAX_WORDS):
+            # a one- or two-word sentence (e.g. a list marker "one.") is a
+            # natural short pause, not full prose -- use the colon/semicolon
+            # tier instead of the standard sentence_end minimum.
+            threshold = PUNCTUATION_THRESHOLDS["colon_semicolon"]
         passed = None if not aligned or threshold is None else gap >= threshold
         measured = {
             **boundary,
@@ -424,11 +448,27 @@ def _phrase_in(asr: list, phrase: list, ratio: float) -> bool:
     return False
 
 
+def is_fragile_mandatory(phrase: list) -> bool:
+    """A mandatory item is ASR-fragile when it is a single bare number word/
+    digit (0-99) after canonicalization, e.g. an enumerated-list marker
+    ("1." from "one."). Whisper often mishears an isolated number word --
+    "won", merged into the next word -- so, like a proper name the take
+    otherwise renders correctly, its absence alone must not fail the take.
+    Multi-digit numbers (years, page counts) stay hard-mandatory: whisper
+    renders those reliably (see the century-equivalence handling above)."""
+    return (len(phrase) == 1 and phrase[0].isdigit()
+            and len(phrase[0]) <= FRAGILE_NUMBER_DIGITS_MAX)
+
+
 def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_RATIO) -> dict:
     """Each mandatory item (string or token list) must appear as a contiguous,
-    fuzzy-tolerant run in the ASR tokens."""
+    fuzzy-tolerant run in the ASR tokens. Items flagged `is_fragile_mandatory`
+    (bare number-word markers) are reported in `missing_fragile` instead of
+    `missing`: they still count toward `coverage` (computed separately over
+    every expected token), but their absence alone never fails the verdict."""
     items = []
     missing = []
+    missing_fragile = []
     for item in mandatory:
         raw_phrase = item if isinstance(item, str) else " ".join(map(str, item))
         phrase = tokenize(raw_phrase)
@@ -437,8 +477,8 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
         label = item if isinstance(item, str) else " ".join(map(str, item))
         items.append(label)
         if not _phrase_in(asr, phrase, ratio):
-            missing.append(label)
-    return {"items": items, "missing": missing}
+            (missing_fragile if is_fragile_mandatory(phrase) else missing).append(label)
+    return {"items": items, "missing": missing, "missing_fragile": missing_fragile}
 
 
 def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
@@ -454,7 +494,10 @@ def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
 def derive_mandatory(expected_tokens: list) -> list:
     """Default mandatory content: digits plus content words (len >= 6, not
     function words) from the expected text. Callers may pass an explicit
-    `mandatory` list to override."""
+    `mandatory` list to override. `check_mandatory` (not this function)
+    decides which of these items are hard-mandatory vs. ASR-fragile bare
+    number words -- both are returned here so fragile items still count
+    toward the returned candidate set."""
     out = []
     seen = set()
     for tok in expected_tokens:
@@ -1023,6 +1066,36 @@ def selfcheck() -> int:
           check_mandatory(["genghis", "khan", "ruled"], ["genghis khan"])["missing"] == [])
     check("mandatory rejects scattered phrase",
           check_mandatory(["khan", "x", "genghis"], ["genghis khan"])["missing"] == ["genghis khan"])
+
+    # bare number-word markers (enumerated-list items like "one.") are
+    # ASR-fragile: Whisper often mishears an isolated number word, so their
+    # absence alone must not fail the take, but they are reported (and still
+    # count toward the ordered `coverage` check computed separately).
+    check("bare number word is fragile", is_fragile_mandatory(tokenize("one")))
+    check("multi-digit number word is not fragile (e.g. a year)",
+          not is_fragile_mandatory(tokenize("fourteen oh five")))
+    check("multi-token phrase is not fragile",
+          not is_fragile_mandatory(tokenize("genghis khan")))
+    list_marker_mand = check_mandatory(tokenize("won the appearance of a single global market"),
+                                       derive_mandatory(tokenize(
+                                           "one. the appearance of a single global market")))
+    check("missing bare number marker is not hard-mandatory",
+          list_marker_mand["missing"] == [], repr(list_marker_mand))
+    check("missing bare number marker is recorded as fragile",
+          list_marker_mand["missing_fragile"] == ["1"], repr(list_marker_mand))
+    list_marker_exp = tokenize("one. the appearance of a single global market")
+    list_marker_asr = tokenize("won the appearance of a single global market")
+    list_marker_verdict = verdict({
+        "coverage": ordered_coverage(list_marker_exp, list_marker_asr),
+        "mandatory": check_mandatory(list_marker_asr, derive_mandatory(list_marker_exp)),
+        "terminal": terminal_suffix(list_marker_exp, list_marker_asr),
+        "confidence": {}, "repetition": {"max_multiplicity": 0},
+        "words": {"max_internal_gap_s": 0}, "leakage": {"flagged": False},
+        "punctuation": {"boundaries": []},
+    })
+    check("list-marker paragraph passes despite missing bare number word",
+          list_marker_verdict[0] == "PASS", repr(list_marker_verdict))
+
     check("terminal suffix present",
           terminal_suffix(tokenize("the history attempts to explain"),
                           tokenize("the history attempts to explain"))["matched"])
@@ -1067,6 +1140,27 @@ def selfcheck() -> int:
           punctuation["parenthetical_comma"]["passed"] == 1)
     check("ordinary comma is advisory",
           punctuation["comma"]["checked"] == 1 and punctuation["comma"]["failed"] == 0)
+
+    # An enumerated-list marker ("one.") is a one-word sentence read with a
+    # shorter, natural pause -- its sentence_end boundary uses the
+    # colon_semicolon (100ms) tier. An ordinary multi-word sentence keeps
+    # the standard 150ms minimum.
+    list_marker_source = "one. the appearance of a single global market."
+    list_marker_words = [
+        {"text": text, "start": i * 0.3, "end": i * 0.3 + 0.1}
+        for i, text in enumerate(tokenize(list_marker_source))
+    ]
+    list_marker_punct = punctuation_metrics(list_marker_source, list_marker_words)
+    sentence_boundaries = [b for b in list_marker_punct["boundaries"] if b["kind"] == "sentence_end"]
+    check("one-word sentence boundary uses the 100ms threshold",
+          sentence_boundaries[0]["sentence_word_count"] == 1 and
+          sentence_boundaries[0]["threshold_s"] == PUNCTUATION_THRESHOLDS["colon_semicolon"],
+          repr(sentence_boundaries[0]))
+    check("normal multi-word sentence boundary keeps the 150ms threshold",
+          sentence_boundaries[1]["sentence_word_count"] > SHORT_SENTENCE_MAX_WORDS and
+          sentence_boundaries[1]["threshold_s"] == PUNCTUATION_THRESHOLDS["sentence_end"],
+          repr(sentence_boundaries[1]))
+
     short_words = words[:2] + words[3:]
     diagnostic = punctuation_metrics(source, short_words)
     check("unaligned punctuation stays diagnostic",
@@ -1113,8 +1207,9 @@ def selfcheck() -> int:
           set(serialized["punctuation"]) == {"boundaries", "sentence_end", "colon_semicolon",
                                                "parenthetical_comma", "comma"} and
           set(serialized["punctuation"]["boundaries"][0]) == {
-              "kind", "punctuation", "expected_token_index", "asr_token_index",
-              "next_asr_token_index", "aligned", "gap_s", "threshold_s", "passed"})
+              "kind", "punctuation", "expected_token_index", "sentence_word_count",
+              "asr_token_index", "next_asr_token_index", "aligned", "gap_s",
+              "threshold_s", "passed"})
     check("record fields remain JSON-native", serialized == schema_record)
     check("repetition clean sentence",
           repetition_stats(["the", "cat", "sat"])["repeated_count"] == 0)
