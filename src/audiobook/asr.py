@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v17-hyphen-equivalence"
+VALIDATION_POLICY = "paragraph-v18-thousand-equivalence"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -198,6 +198,28 @@ def _merge_hundreds_decade_tokens(tokens: list) -> list:
         i += 1
     return merged
 
+
+def _merge_thousand_tokens(tokens: list) -> list:
+    """Canonicalize spoken ``one thousand``/written ``1000``: any digit
+    token (a number word, or an already-merged hundred value, e.g. ``six
+    hundred`` -> ``600``) followed by "thousand" multiplies by 1000, the
+    same pattern as the century/hundred merges above. Unlike "N hundred"
+    (where a non-teen two-digit prefix like "twenty hundred" is not
+    idiomatic), "N thousand" is unambiguous English for any N, so every
+    digit prefix qualifies."""
+    merged = []
+    i = 0
+    while i < len(tokens):
+        if (i + 1 < len(tokens) and str(tokens[i]).isdigit()
+                and str(tokens[i + 1]) == "thousand"
+                and (i + 2 == len(tokens) or not str(tokens[i + 2]).isdigit())):
+            merged.append(str(int(tokens[i]) * 1000))
+            i += 2
+            continue
+        merged.append(tokens[i])
+        i += 1
+    return merged
+
 _DECADE_NUMERIC_RE = re.compile(r"^(1[0-9])(\d0)(?:'s|s)$")
 
 def _merge_decade_tokens(tokens: list) -> list:
@@ -295,7 +317,8 @@ def tokenize(text: str) -> list:
     if run:
         merged.append("".join(run))
     return _canonicalize_bare_decades(
-        _merge_hundreds_decade_tokens(_merge_century_tokens(_merge_decade_tokens(merged))))
+        _merge_thousand_tokens(
+            _merge_hundreds_decade_tokens(_merge_century_tokens(_merge_decade_tokens(merged)))))
 
 
 
@@ -1295,6 +1318,24 @@ def selfcheck() -> int:
           tokenize("fourteen hundreds") == tokenize("1400s"))
     check("different century-block remains distinct",
           tokenize("four hundreds") != tokenize("nine hundreds"))
+
+    # "N thousand" multiplies by 1000 for any digit prefix -- unlike "N
+    # hundred", there is no non-idiomatic two-digit case to exclude ("twenty
+    # thousand" is ordinary English), and a merged hundred value chains in
+    # ("six hundred thousand" -> "600" -> "600000").
+    check("spoken thousand equals written digits",
+          tokenize("one thousand") == tokenize("1000"))
+    check("thousand equivalence reaches coverage",
+          ordered_coverage(tokenize("between five hundred and one thousand"),
+                           tokenize("between 500 and 1000"))["missing"] == [])
+    check("thousand equivalence reaches mandatory",
+          check_mandatory(tokenize("between 500 and 1000"), ["one thousand"])["missing"] == [])
+    check("thousand count continuation remains distinct",
+          tokenize("one thousand one") != tokenize("1000"))
+    check("hundred-thousand compound chains through both merges",
+          tokenize("six hundred thousand") == tokenize("600000") == ["600000"])
+    check("different thousand remains distinct",
+          tokenize("one thousand") != tokenize("two thousand"))
     check("tokenize lowercases + strips punctuation",
           tokenize("The DEATH, of Tamerlane!") == ["the", "death", "of", "tamerlane"])
     check("number words -> digits", tokenize("fourteen oh five") == ["1405"])
