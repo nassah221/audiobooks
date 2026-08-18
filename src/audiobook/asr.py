@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v18-thousand-equivalence"
+VALIDATION_POLICY = "paragraph-v19-hundred-and-remainder"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -220,6 +220,30 @@ def _merge_thousand_tokens(tokens: list) -> list:
         i += 1
     return merged
 
+
+def _merge_century_remainder_tokens(tokens: list) -> list:
+    """Canonicalize the classic English year idiom "eight hundred and
+    forty-three" (843) / "nineteen hundred and eighty-four" (1984): an
+    explicit "and" plus a 1-99 remainder adds onto an already-merged
+    hundred/century/thousand value (any multiple of 100). The "and" is the
+    disambiguating signal -- without it ("fourteen hundred one") this is
+    not idiomatic English for a single number, so _merge_century_tokens's
+    own guard already leaves that case unmerged before this pass runs."""
+    merged = []
+    i = 0
+    while i < len(tokens):
+        if (i + 2 < len(tokens) and str(tokens[i]).isdigit()
+                and int(tokens[i]) > 0 and int(tokens[i]) % 100 == 0
+                and str(tokens[i + 1]) == "and"
+                and str(tokens[i + 2]).isdigit() and 1 <= int(tokens[i + 2]) <= 99
+                and (i + 3 == len(tokens) or not str(tokens[i + 3]).isdigit())):
+            merged.append(str(int(tokens[i]) + int(tokens[i + 2])))
+            i += 3
+            continue
+        merged.append(tokens[i])
+        i += 1
+    return merged
+
 _DECADE_NUMERIC_RE = re.compile(r"^(1[0-9])(\d0)(?:'s|s)$")
 
 def _merge_decade_tokens(tokens: list) -> list:
@@ -317,8 +341,9 @@ def tokenize(text: str) -> list:
     if run:
         merged.append("".join(run))
     return _canonicalize_bare_decades(
-        _merge_thousand_tokens(
-            _merge_hundreds_decade_tokens(_merge_century_tokens(_merge_decade_tokens(merged)))))
+        _merge_century_remainder_tokens(
+            _merge_thousand_tokens(
+                _merge_hundreds_decade_tokens(_merge_century_tokens(_merge_decade_tokens(merged))))))
 
 
 
@@ -1283,6 +1308,23 @@ def selfcheck() -> int:
           tokenize("fourteen hundred") != tokenize("fifteen hundred"))
     check("century count continuation remains distinct",
           tokenize("fourteen hundred one") != tokenize("1400"))
+
+    # The classic English year idiom "N hundred and M" (843, 1984, ...): the
+    # explicit "and" is the disambiguating signal that separates this from
+    # the "fourteen hundred one" case above (no "and" -- not idiomatic for
+    # a single number, so it stays unmerged).
+    check("hundred-and-remainder equals the written year",
+          tokenize("eight hundred and forty-three") == tokenize("843") == ["843"])
+    check("century-and-remainder equals the written year",
+          tokenize("nineteen hundred and eighty-four") == tokenize("1984") == ["1984"])
+    check("hundred-and-remainder reaches coverage",
+          ordered_coverage(tokenize("fallen apart by eight hundred and forty-three"),
+                           tokenize("fallen apart by 843"))["missing"] == [])
+    check("hundred-and-remainder reaches mandatory",
+          check_mandatory(tokenize("fallen apart by 843"),
+                          ["eight hundred and forty-three"])["missing"] == [])
+    check("without 'and' the remainder stays unmerged (not idiomatic)",
+          tokenize("eight hundred forty-three") != tokenize("843"))
     check("non-century prefix remains distinct",
           tokenize("twenty hundred") != tokenize("2000"))
     check("plural hundred remains distinct",
