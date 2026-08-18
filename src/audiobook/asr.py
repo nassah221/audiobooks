@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v20-hyphen-phrase-derivation"
+VALIDATION_POLICY = "paragraph-v21-unified-lexical-equivalence"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -274,6 +274,23 @@ _TENS_COMPOUND_RE = re.compile(
     r"(one|two|three|four|five|six|seven|eight|nine)\b"
 )
 
+# American "-ize" <-> British "-ise" spelling family: sound-preserving, so
+# canonicalizing one fixed direction (here, -ize forms -> -ise forms) makes
+# "colonized"/"colonised" the same token without any fuzzy tolerance. This
+# is the live-gate promotion of the same equivalence adjudicate.py's
+# lenient_coverage already applies post-hoc. Anchored to known suffixes
+# (word-final) rather than a blanket "z"->"s", to limit collateral hits on
+# unrelated words that happen to contain "iz" (still not zero -- "size",
+# "prize" end in one of these suffixes too -- but since the same function
+# processes source and transcript alike, a coincidental hit is consistent
+# on both sides and costs nothing at comparison time).
+_IZE_SUFFIX_RE = re.compile(r"iz(e|es|ed|ing|ation|ations|er|ers|able|ability)\b")
+
+
+def _canonicalize_spelling(word: str) -> str:
+    return _IZE_SUFFIX_RE.sub(lambda m: "is" + m.group(1), word)
+
+
 # function words >= 5 chars that are not load-bearing content
 _FUNCTION_WORDS = {
     "within", "during", "around", "before", "after", "between", "through",
@@ -328,7 +345,7 @@ def tokenize(text: str) -> list:
         elif tok == "oh":
             out.append("0")
         else:
-            out.append(tok)
+            out.append(_canonicalize_spelling(tok))
     merged = []
     run = []
     for tok in out:
@@ -567,7 +584,13 @@ def ordered_coverage(expected: list, asr: list) -> dict:
     classic LCS DP, so an expected token absent from the audio only costs
     itself, never the tokens after it. O(len(expected) * len(asr)) — trivial
     at sentence scale.
+
+    Both lists are first reconciled across hyphen/compound-word boundaries
+    (`_reconcile_concat_boundaries`): a token-boundary difference like
+    "waste lands" / "wastelands" is orthography-only, so it must not cost
+    a match here any more than it does in the mandatory-word gate.
     """
+    expected, asr = _reconcile_concat_boundaries(expected, asr)
     n, m = len(expected), len(asr)
     dp = [[0] * (m + 1) for _ in range(n + 1)]
     for i in range(n - 1, -1, -1):
@@ -732,6 +755,44 @@ def _concat_match(phrase: list, asr: list) -> str:
     return None
 
 
+_CONCAT_RECONCILE_MAX_SPAN = 3
+
+
+def _concat_reconcile(a: list, b: list) -> list:
+    """Rewrite `a` so a token-boundary difference from a hyphen or compound-
+    word split against `b` doesn't cost a coverage/terminal match: wherever
+    a run of 2-3 adjacent tokens in `a` concatenates to exactly equal some
+    token in `b`, collapse the run into that single token. Exact string
+    equality only -- orthography-only and sound-preserving, the same
+    equivalence `_concat_match` already applies to the mandatory-word gate
+    (v17/v20), extended here to coverage and terminal matching so all three
+    lexical gates agree on what counts as the same word."""
+    b_set = set(b)
+    out = []
+    i, n = 0, len(a)
+    while i < n:
+        merged = None
+        for span in range(min(_CONCAT_RECONCILE_MAX_SPAN, n - i), 1, -1):
+            candidate = "".join(a[i:i + span])
+            if candidate in b_set:
+                merged = candidate
+                break
+        if merged is not None:
+            out.append(merged)
+            i += span
+        else:
+            out.append(a[i])
+            i += 1
+    return out
+
+
+def _reconcile_concat_boundaries(expected: list, asr: list) -> tuple:
+    """Reconcile both directions: merge `expected` runs that concatenate to
+    an `asr` token, and merge `asr` runs that concatenate to an `expected`
+    token, each against the other's original (pre-reconciliation) list."""
+    return _concat_reconcile(expected, asr), _concat_reconcile(asr, expected)
+
+
 def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_RATIO) -> dict:
     """Each mandatory item (string or token list) must appear as a contiguous,
     fuzzy-tolerant run in the ASR tokens, or match across a hyphen boundary
@@ -778,9 +839,16 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
 
 
 def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
-    """Require the final expected phrase near the end of the transcript."""
-    tail = expected[-size:]
-    window = asr[-(len(tail) + 2):]
+    """Require the final expected phrase near the end of the transcript.
+
+    Reconciled across hyphen/compound-word boundaries first, same as
+    `ordered_coverage`, so a tail like "waste lands were colonized" matches
+    a transcript ending "wastelands were colonised" -- the reported
+    `expected` phrase reflects the reconciled tail actually checked.
+    """
+    r_expected, r_asr = _reconcile_concat_boundaries(expected, asr)
+    tail = r_expected[-size:]
+    window = r_asr[-(len(tail) + 2):]
     return {
         "expected": " ".join(tail),
         "matched": not tail or _phrase_in(window, tail, MANDATORY_FUZZY_RATIO),
@@ -1610,6 +1678,35 @@ def selfcheck() -> int:
     check("derive_mandatory without expected_text keeps the old atomic behavior",
           derive_mandatory(tokenize("The death of Tamerlane in 1405 was a turning point."))
           == ["tamerlane", "1405", "turning"])
+
+    # v21: a single canonicalization (ise/ize spelling + compound/adjacency
+    # concatenation) applied to both source and transcript token streams,
+    # now reaching coverage and terminal too -- not just the mandatory gate.
+    wastelands_expected = tokenize("Waste lands were colonized.")
+    wastelands_asr = tokenize("Wastelands were colonised.")
+    check("spelling canonicalization alone: colonized == colonised",
+          tokenize("colonized") == tokenize("colonised") == ["colonised"])
+    check("compound canonicalization alone: waste lands == wastelands",
+          _concat_reconcile(["waste", "lands"], ["wastelands"]) == ["wastelands"])
+    check("both equivalences combined pass coverage",
+          ordered_coverage(wastelands_expected, wastelands_asr)["missing"] == [] and
+          ordered_coverage(wastelands_expected, wastelands_asr)["fraction"] == 1.0,
+          repr(ordered_coverage(wastelands_expected, wastelands_asr)))
+    check("both equivalences combined pass terminal",
+          terminal_suffix(wastelands_expected, wastelands_asr)["matched"])
+    check("a genuinely absent word still fails coverage on a short sentence",
+          ordered_coverage(wastelands_expected, tokenize("something completely different"))
+          ["fraction"] < 0.85)
+    check("a wrong word still fails coverage (colonized vs demolished)",
+          "colonised" in ordered_coverage(
+              tokenize("waste lands were colonized"),
+              tokenize("waste lands were demolished"))["missing"])
+    check("a wrong word still fails terminal (colonized vs demolished)",
+          not terminal_suffix(tokenize("waste lands were colonized"),
+                              tokenize("waste lands were demolished"))["matched"])
+    check("non-adjacent concatenation still rejected in coverage",
+          _concat_reconcile(["waste", "utterly", "lands"], ["wastelands"])
+          == ["waste", "utterly", "lands"])
 
     check("terminal suffix present",
           terminal_suffix(tokenize("the history attempts to explain"),
