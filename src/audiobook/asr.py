@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v15-circa-abbreviation"
+VALIDATION_POLICY = "paragraph-v16-century-block"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -177,6 +177,27 @@ def _merge_century_tokens(tokens: list) -> list:
         i += 1
     return merged
 
+
+def _merge_hundreds_decade_tokens(tokens: list) -> list:
+    """Canonicalize spoken ``four hundreds``/written ``400s``: a
+    century-block decade reference (the 5th-century era, 400-499), the
+    plural sibling of the plain ``four hundred``/``400`` merge above.
+    epub.expand_numbers renders "400s" as "four hundreds" when speaking the
+    book, so Whisper's preferred digit rendering ("the 400s") needs the
+    same token as the source text's spelled-out plural."""
+    merged = []
+    i = 0
+    while i < len(tokens):
+        if (i + 1 < len(tokens) and str(tokens[i]) in _CENTURY_PREFIXES
+                and str(tokens[i + 1]) == "hundreds"
+                and (i + 2 == len(tokens) or not str(tokens[i + 2]).isdigit())):
+            merged.append(f"{_CENTURY_PREFIXES[str(tokens[i])]}s")
+            i += 2
+            continue
+        merged.append(tokens[i])
+        i += 1
+    return merged
+
 _DECADE_NUMERIC_RE = re.compile(r"^(1[0-9])(\d0)(?:'s|s)$")
 
 def _merge_decade_tokens(tokens: list) -> list:
@@ -273,7 +294,8 @@ def tokenize(text: str) -> list:
             merged.append(tok)
     if run:
         merged.append("".join(run))
-    return _canonicalize_bare_decades(_merge_century_tokens(_merge_decade_tokens(merged)))
+    return _canonicalize_bare_decades(
+        _merge_hundreds_decade_tokens(_merge_century_tokens(_merge_decade_tokens(merged))))
 
 
 
@@ -1221,6 +1243,23 @@ def selfcheck() -> int:
           tokenize("three hundred one") != tokenize("300"))
     check("different hundred-quantity remains distinct",
           tokenize("three hundred") != tokenize("four hundred"))
+
+    # "N hundreds" (plural) is a century-block decade reference ("the four
+    # hundreds" = the 400s era), the plural sibling of the plain N-hundred
+    # quantity above -- epub.expand_numbers renders written "400s" as
+    # spoken "four hundreds", so Whisper's digit rendering needs to match.
+    check("spoken century-block equals written digits",
+          tokenize("four hundreds") == tokenize("400s"))
+    check("century-block equivalence reaches coverage",
+          ordered_coverage(tokenize("by the four hundreds"),
+                           tokenize("by the 400s"))["missing"] == [])
+    check("century-block equivalence reaches mandatory",
+          check_mandatory(tokenize("by the 400s"), ["four hundreds"])["missing"] == [])
+    check("plural hundred still distinct from the bare year",
+          tokenize("fourteen hundreds") != tokenize("1400") and
+          tokenize("fourteen hundreds") == tokenize("1400s"))
+    check("different century-block remains distinct",
+          tokenize("four hundreds") != tokenize("nine hundreds"))
     check("tokenize lowercases + strips punctuation",
           tokenize("The DEATH, of Tamerlane!") == ["the", "death", "of", "tamerlane"])
     check("number words -> digits", tokenize("fourteen oh five") == ["1405"])
