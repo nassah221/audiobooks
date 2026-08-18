@@ -1918,6 +1918,21 @@ def selfcheck() -> int:
           and qwenfix.SIBILANT_FINAL.search("centuries") is not None
           and qwenfix.SIBILANT_FINAL.search("delhi") is None
           and qwenfix.SIBILANT_FINAL.search("planned") is None)
+
+    # Decode shape bucketing (pure array op; no model load).
+    import mlx.core as mx
+
+    _bucket_exact = mx.zeros((1, qwenfix.DECODE_BUCKET_FRAMES * 3, 16))
+    _bucket_exact_out, _bucket_exact_pad = qwenfix._pad_codes_to_bucket(_bucket_exact)
+    check("bucketing is a no-op on an exact multiple",
+          _bucket_exact_pad == 0 and _bucket_exact_out is _bucket_exact)
+    _bucket_short = mx.arange(2 * 16).reshape(1, 2, 16).astype(mx.float32)
+    _bucket_short_out, _bucket_short_pad = qwenfix._pad_codes_to_bucket(_bucket_short, bucket=5)
+    check("bucketing pads to the next multiple by repeating the last frame",
+          _bucket_short_pad == 3
+          and _bucket_short_out.shape == (1, 5, 16)
+          and bool(mx.all(_bucket_short_out[:, 2:] == _bucket_short_out[:, 2:3]).item()))
+
     sib_gen = object.__new__(Generator)
     sib_gen.validate = False
     sib_gen._records = {}

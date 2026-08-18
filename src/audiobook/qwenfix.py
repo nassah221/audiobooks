@@ -70,6 +70,42 @@ SIBILANT_WINDOW_SECONDS = 0.35
 
 _SILENCE_AMPLITUDE = 0.01
 
+# mlx-audio compiles the vocoder decoder with ``mx.compile`` at model load
+# (qwen3_tts.py, ~line 2903), which retraces whenever ``chunked_decode`` is
+# called with a frame count it has not seen before. Almost every chunk has a
+# distinct generated length, so that retrace runs on nearly every take,
+# costing an extra 0.6-1.6 s on top of the 0.7 s warm decode. Padding the
+# decode input up to the next multiple of this bucket size, by repeating the
+# last frame, collapses the space of shapes ``chunked_decode`` sees down to
+# ~13 buckets instead of one per chunk. The bucket size matches
+# ``chunked_decode``'s own ``left_context_size`` (mlx_audio speech_tokenizer.py
+# ~line 936).
+DECODE_BUCKET_FRAMES = 25
+
+
+def _pad_codes_to_bucket(codes, bucket: int = DECODE_BUCKET_FRAMES):
+    """Pad ``codes`` (``[1, T, num_code_groups]``) on the time axis (1) to
+    the next multiple of ``bucket`` frames by repeating the last frame.
+
+    The decoder stack is causal, so appending repeated frames after the
+    real ones cannot change the decoded samples for the real frames (each
+    output sample depends only on current and earlier input frames); see
+    ``chunked_decode`` bucketing verification in the qwenfix commit that
+    introduced this. Returns ``(padded_codes, pad_frames)``; ``pad_frames``
+    is 0 (and ``padded_codes is codes``) when ``codes`` already lands on a
+    bucket boundary.
+    """
+    import mlx.core as mx
+
+    t = codes.shape[1]
+    remainder = t % bucket
+    if remainder == 0:
+        return codes, 0
+    pad_frames = bucket - remainder
+    last_frame = codes[:, t - 1:t, :]
+    pad = mx.repeat(last_frame, pad_frames, axis=1)
+    return mx.concatenate([codes, pad], axis=1), pad_frames
+
 
 def _prepare_icl_inputs_with_context(model, text, ref_audio, ref_text, language,
                                       prev_text=None, prev_codes=None):
@@ -349,11 +385,15 @@ def generate_icl_tail_safe(model, text, ref_audio, ref_text, language,
     ref_t = mx.transpose(ref_codes, (0, 2, 1))
     full = mx.concatenate([ref_t, gen_codes], axis=1)
 
-    # Decode everything in one pass; cut the reference region exactly.
+    # Decode everything in one pass, at a bucketed shape (see
+    # DECODE_BUCKET_FRAMES), then cut the reference region exactly.
+    padded, pad_frames = _pad_codes_to_bucket(full)
     wav = model.speech_tokenizer.decoder.chunked_decode(
-        mx.transpose(full, (0, 2, 1))).squeeze(1)
+        mx.transpose(padded, (0, 2, 1))).squeeze(1)
     mx.eval(wav)
-    upsample = wav.shape[1] // full.shape[1]
+    upsample = wav.shape[1] // padded.shape[1]
+    if pad_frames:
+        wav = wav[:, :wav.shape[1] - pad_frames * upsample]
     ref_len = ref_codes.shape[2]
     audio = np.asarray(wav[0, ref_len * upsample:].astype(mx.float32))
 
