@@ -28,7 +28,8 @@ Record schema (all values JSON-native):
     transcript, transcript_normalized, asr_tokens,
     confidence: {avg_logprob, no_speech_prob, compression_ratio},
     coverage: {expected_tokens, matched_tokens, fraction, missing},
-    mandatory: {items, missing, missing_fragile, phonetic_matches, hyphen_matches, vowel_matches},
+    mandatory: {items, missing, missing_fragile, phonetic_matches, hyphen_matches,
+                vowel_matches, transliteration_matches},
     terminal: {expected, matched},
     repetition: {max_multiplicity, most_repeated, repeated_count}
     leakage: {flagged, detail},
@@ -65,7 +66,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v22-vowel-transliteration"
+VALIDATION_POLICY = "paragraph-v23-curated-transliteration-pairs"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -642,8 +643,52 @@ def _is_vowel_swap(a: str, b: str) -> bool:
     return diff is not None and diff[0] in _VOWELS and diff[1] in _VOWELS
 
 
+# Curated transliteration-equivalent pairs: names and loanwords with a
+# well-established alternate English spelling that is NOT a single
+# vowel-for-vowel substitution (_is_vowel_swap already covers those, e.g.
+# amir/emir) -- so a general rule can't reach them, and a fuzzy ratio would
+# either miss them or blur genuinely different words. Each pair must be
+# justified as two spellings of the SAME referent (verified against the
+# source text and, for names, an outside reference), never a mangled form
+# (that is v12's phonetic-match job) and never two ordinary English words
+# that happen to look alike (no form/farm-type pairs).
+#
+# Extend this set following the standing self-extension lane: add a pair
+# without stopping the line only when (1) the only miss in an otherwise
+# content-correct transcript is the candidate token, (2) both forms are
+# verifiably established spellings of the same loanword/proper noun (a
+# recognized transliteration alternation, e.g. k/q, ee/i, oo/u, dj/j,
+# gh/g, single/double consonant), and (3) neither form is an ordinary
+# English content word with its own distinct meaning. Anything short of
+# all three still stops the line for a decision, the same as before this
+# lane existed.
+#
+# Seeded from paragraphs that actually hit this in ch01: Whisper renders
+# "Koranic" (source spelling, used throughout the book) as "Quranic" --
+# same holy book, k/q is a standard Arabic-transliteration alternation.
+# "Genghis"/"Chinggis" (source: "the Mongol empire of Genghis (Chinggis
+# Khan)") names the same 13th-century Mongol ruler; the book itself
+# glosses one against the other. Checked and deliberately NOT added:
+# Muhammad/Mohammed (this book uses "Mohammed" for a distinct 18th-century
+# Qajar shah, "Agha Mohammed" -- not the Prophet -- so the two spellings
+# are not interchangeable here); khalifa/caliph(ate) (person vs.
+# institution, not a spelling variant); Tamerlane/Timur (an epithet vs. a
+# given name, not a transliteration pair).
+_TRANSLITERATION_PAIRS = frozenset({
+    frozenset({"koran", "quran"}),
+    frozenset({"koranic", "quranic"}),
+    frozenset({"genghis", "chinggis"}),
+})
+
+
+def _is_transliteration_pair(a: str, b: str) -> bool:
+    return frozenset({a, b}) in _TRANSLITERATION_PAIRS
+
+
 def _tok_eq(a: str, b: str, ratio: float) -> bool:
     if a == b:
+        return True
+    if _is_transliteration_pair(a, b):
         return True
     # phonetic tolerance for proper nouns ("Tamerlane" ~ "Tamalane") without
     # letting short function words match anything
@@ -659,6 +704,15 @@ def _find_vowel_match(word: str, asr: list) -> str:
     `word` (see `_is_vowel_swap`), or None."""
     for candidate in asr:
         if _is_vowel_swap(word, candidate):
+            return candidate
+    return None
+
+
+def _find_transliteration_match(word: str, asr: list) -> str:
+    """First ASR token that is a curated transliteration variant of `word`
+    (see `_TRANSLITERATION_PAIRS`), or None."""
+    for candidate in asr:
+        if _is_transliteration_pair(word, candidate):
             return candidate
     return None
 
@@ -842,14 +896,17 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
     every such acceptance. A single-token item that already passed via the
     shared `_tok_eq` comparator's vowel-swap tolerance (a loanword
     transliteration variant, e.g. "amir" -> "emir") is also noted in
-    `vowel_matches` for the same audit, even though it was never at risk of
-    hard-failing here."""
+    `vowel_matches`, and one that passed via a curated transliteration pair
+    (`_TRANSLITERATION_PAIRS`, e.g. "koranic" -> "quranic") in
+    `transliteration_matches`, for the same audit, even though neither was
+    ever at risk of hard-failing here."""
     items = []
     missing = []
     missing_fragile = []
     phonetic_matches = {}
     hyphen_matches = {}
     vowel_matches = {}
+    transliteration_matches = {}
     for item in mandatory:
         raw_phrase = item if isinstance(item, str) else " ".join(map(str, item))
         phrase = tokenize(raw_phrase)
@@ -862,6 +919,9 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
                 vmatch = _find_vowel_match(phrase[0], asr)
                 if vmatch:
                     vowel_matches[label] = vmatch
+                tmatch = _find_transliteration_match(phrase[0], asr)
+                if tmatch:
+                    transliteration_matches[label] = tmatch
             continue
         concat = _concat_match(phrase, asr)
         if concat:
@@ -879,7 +939,7 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
         missing.append(label)
     return {"items": items, "missing": missing, "missing_fragile": missing_fragile,
             "phonetic_matches": phonetic_matches, "hyphen_matches": hyphen_matches,
-            "vowel_matches": vowel_matches}
+            "vowel_matches": vowel_matches, "transliteration_matches": transliteration_matches}
 
 
 def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
@@ -1779,6 +1839,31 @@ def selfcheck() -> int:
           amir_mandatory["missing"] == [] and
           amir_mandatory["vowel_matches"] == {"amir": "emir"},
           repr(amir_mandatory))
+
+    # v23: a curated pair list for transliteration variants that aren't a
+    # single vowel swap ("koranic"/"quranic" differ by a consonant AND a
+    # vowel: k/q, o/u) -- v22's general rule can't reach these, so each
+    # pair is individually justified as two spellings of the same referent.
+    check("koran matches its transliteration variant quran",
+          _is_transliteration_pair("koran", "quran"))
+    check("koranic matches its transliteration variant quranic",
+          _is_transliteration_pair("koranic", "quranic"))
+    check("genghis matches its transliteration variant chinggis",
+          _is_transliteration_pair("genghis", "chinggis"))
+    check("an unrelated word is not a curated transliteration pair",
+          not _is_transliteration_pair("koran", "random") and
+          not _tok_eq("koran", "random", MANDATORY_FUZZY_RATIO))
+    koranic_terminal = terminal_suffix(
+        tokenize("their ultimate loyalty was to Koranic law which they interpreted."),
+        tokenize("their ultimate loyalty was to Quranic law which they interpreted."))
+    check("koranic/quranic passes the terminal-phrase gate",
+          koranic_terminal["matched"], repr(koranic_terminal))
+    koranic_mandatory = check_mandatory(tokenize("their loyalty was to Quranic law"),
+                                        ["koranic"])
+    check("koranic/quranic is recorded in transliteration_matches for the morning audit",
+          koranic_mandatory["missing"] == [] and
+          koranic_mandatory["transliteration_matches"] == {"koranic": "quranic"},
+          repr(koranic_mandatory))
 
     check("terminal suffix present",
           terminal_suffix(tokenize("the history attempts to explain"),
