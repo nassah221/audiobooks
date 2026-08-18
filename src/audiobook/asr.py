@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v13-hundred-quantity"
+VALIDATION_POLICY = "paragraph-v14-semicolon-conjunction"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -306,6 +306,7 @@ def normalized_word_timings(segments: list) -> list:
 
 _INITIALS_RE = re.compile(r"(?:[A-Z]\.)+")
 _COMPLEMENTIZER_THAT_RE = re.compile(r"^\s*that\b")
+_SERIAL_CONJUNCTION_RE = re.compile(r"^\s*(?:and|or)\b")
 
 
 def _is_sentence_abbreviation(word: str) -> bool:
@@ -385,6 +386,15 @@ def _source_punctuation_boundaries(source: str) -> list:
                 # start a new independent clause instead.
                 after = source[chunk_match.start() + punctuation.end():]
                 boundary["colon_complementizer_that"] = bool(_COMPLEMENTIZER_THAT_RE.match(after))
+            if kind == "colon_semicolon" and mark[0] == ";":
+                # A semicolon closing a serial list's final item ("a space;
+                # a community; and a programme") reads straight through --
+                # the conjunction itself marks the final item, so read-
+                # through is the natural rendering. A non-final semicolon in
+                # the same list, or one followed by anything but a lowercase
+                # "and"/"or", stays gated at 100ms.
+                after = source[chunk_match.start() + punctuation.end():]
+                boundary["semicolon_serial_conjunction"] = bool(_SERIAL_CONJUNCTION_RE.match(after))
             boundaries.append(boundary)
     return boundaries
 
@@ -434,10 +444,17 @@ def punctuation_metrics(source: str, word_timings: list) -> dict:
             # natural short pause, not full prose -- use the colon/semicolon
             # tier instead of the standard sentence_end minimum.
             threshold = PUNCTUATION_THRESHOLDS["colon_semicolon"]
+        exemption_reason = None
         if kind == "colon_semicolon" and boundary.get("colon_complementizer_that"):
             # "held good: that European depictions..." reads straight
             # through the colon -- advisory only, like a plain comma.
             threshold = None
+            exemption_reason = "colon_complementizer_that"
+        if kind == "colon_semicolon" and boundary.get("semicolon_serial_conjunction"):
+            # "a space; a community; and a programme" reads straight through
+            # the final semicolon -- the conjunction marks the last item.
+            threshold = None
+            exemption_reason = "semicolon_serial_conjunction"
         passed = None if not aligned or threshold is None else gap >= threshold
         measured = {
             **boundary,
@@ -447,6 +464,7 @@ def punctuation_metrics(source: str, word_timings: list) -> dict:
             "gap_s": gap,
             "threshold_s": threshold,
             "passed": passed,
+            "exemption_reason": exemption_reason,
         }
         boundaries.append(measured)
         groups[kind].append(measured)
@@ -1489,6 +1507,47 @@ def selfcheck() -> int:
           capitalized_that_boundary["threshold_s"] == PUNCTUATION_THRESHOLDS["colon_semicolon"],
           repr(capitalized_that_boundary))
 
+    # A semicolon closing a serial list's final item ("a space; a
+    # community; and a programme") reads straight through -- the
+    # conjunction itself marks the last item. Only lowercase "and"/"or"
+    # immediately after the semicolon qualifies; anything else (a noun
+    # phrase, "but", an independent clause) keeps the normal 100ms gate,
+    # including a non-final semicolon in the very same list.
+    def _semicolon_boundary(text):
+        words = [{"text": t, "start": i * 0.3, "end": i * 0.3 + 0.05}
+                 for i, t in enumerate(tokenize(text))]
+        boundaries = [b for b in punctuation_metrics(text, words)["boundaries"]
+                     if b["kind"] == "colon_semicolon"]
+        return boundaries[-1]
+
+    serial_and = _semicolon_boundary(
+        "a geographical space; a socio-political community; and a cultural programme.")
+    check("semicolon before final 'and' item is advisory only",
+          serial_and["semicolon_serial_conjunction"] is True and
+          serial_and["threshold_s"] is None and
+          serial_and["exemption_reason"] == "semicolon_serial_conjunction",
+          repr(serial_and))
+    serial_or = _semicolon_boundary("the treaty covered trade; or the state would collapse.")
+    check("semicolon before final 'or' item is advisory only",
+          serial_or["semicolon_serial_conjunction"] is True and serial_or["threshold_s"] is None,
+          repr(serial_or))
+    serial_list_source = "a geographical space; a socio-political community; and a cultural programme."
+    serial_list_words = [{"text": t, "start": i * 0.3, "end": i * 0.3 + 0.05}
+                         for i, t in enumerate(tokenize(serial_list_source))]
+    serial_list_semicolons = [b for b in punctuation_metrics(serial_list_source, serial_list_words)["boundaries"]
+                              if b["kind"] == "colon_semicolon"]
+    non_final_semicolon = serial_list_semicolons[0]
+    check("non-final semicolon in the same list keeps the 100ms threshold",
+          non_final_semicolon["semicolon_serial_conjunction"] is False and
+          non_final_semicolon["threshold_s"] == PUNCTUATION_THRESHOLDS["colon_semicolon"],
+          repr(non_final_semicolon))
+    check("semicolon before a noun phrase stays hard-gated",
+          _semicolon_boundary("community; the programme was launched.")["threshold_s"]
+          == PUNCTUATION_THRESHOLDS["colon_semicolon"])
+    check("semicolon before 'but' stays hard-gated",
+          _semicolon_boundary("a geographical space; but the state intervened.")["threshold_s"]
+          == PUNCTUATION_THRESHOLDS["colon_semicolon"])
+
     short_words = words[:2] + words[3:]
     diagnostic = punctuation_metrics(source, short_words)
     check("unaligned punctuation stays diagnostic",
@@ -1537,7 +1596,7 @@ def selfcheck() -> int:
           set(serialized["punctuation"]["boundaries"][0]) == {
               "kind", "punctuation", "expected_token_index", "sentence_word_count",
               "asr_token_index", "next_asr_token_index", "aligned", "gap_s",
-              "threshold_s", "passed"})
+              "threshold_s", "passed", "exemption_reason"})
     check("record fields remain JSON-native", serialized == schema_record)
     check("repetition clean sentence",
           repetition_stats(["the", "cat", "sat"])["repeated_count"] == 0)
