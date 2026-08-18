@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v10-abbreviations"
+VALIDATION_POLICY = "paragraph-v11-colon-complementizer"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -297,6 +297,7 @@ def normalized_word_timings(segments: list) -> list:
 
 
 _INITIALS_RE = re.compile(r"(?:[A-Z]\.)+")
+_COMPLEMENTIZER_THAT_RE = re.compile(r"^\s*that\b")
 
 
 def _is_sentence_abbreviation(word: str) -> bool:
@@ -367,6 +368,15 @@ def _source_punctuation_boundaries(source: str) -> list:
             if kind == "sentence_end":
                 boundary["sentence_word_count"] = token_index - prev_sentence_end_index
                 prev_sentence_end_index = token_index
+            if kind == "colon_semicolon" and mark[0] == ":":
+                # A colon introducing a complement clause ("held good: that
+                # European depictions...") reads straight through, unlike a
+                # colon before a list or an independent clause -- the
+                # 100ms rule was written for those, not this construction.
+                # Lowercase "that" is the signal: a capitalized "That" would
+                # start a new independent clause instead.
+                after = source[chunk_match.start() + punctuation.end():]
+                boundary["colon_complementizer_that"] = bool(_COMPLEMENTIZER_THAT_RE.match(after))
             boundaries.append(boundary)
     return boundaries
 
@@ -416,6 +426,10 @@ def punctuation_metrics(source: str, word_timings: list) -> dict:
             # natural short pause, not full prose -- use the colon/semicolon
             # tier instead of the standard sentence_end minimum.
             threshold = PUNCTUATION_THRESHOLDS["colon_semicolon"]
+        if kind == "colon_semicolon" and boundary.get("colon_complementizer_that"):
+            # "held good: that European depictions..." reads straight
+            # through the colon -- advisory only, like a plain comma.
+            threshold = None
         passed = None if not aligned or threshold is None else gap >= threshold
         measured = {
             **boundary,
@@ -1275,6 +1289,50 @@ def selfcheck() -> int:
                            if b["kind"] == "sentence_end"]
     check("initials abbreviation (U.S.) produces exactly one real sentence end",
           len(initials_boundaries) == 1, repr(initials_boundaries))
+
+    # A colon introducing a complement clause ("held good: that European
+    # depictions...") reads straight through -- exempt from the 100ms
+    # colon/semicolon minimum, advisory only, like a plain comma. A colon
+    # before a list, or one followed by a capitalized "That" (a new
+    # independent clause), keeps the normal 100ms requirement.
+    complementizer_source = ("But the broader point held good: that European "
+                              "depictions of other parts of the world needed "
+                              "very careful decoding.")
+    complementizer_words = [
+        {"text": t, "start": i * 0.3, "end": i * 0.3 + 0.05}
+        for i, t in enumerate(tokenize(complementizer_source))
+    ]
+    complementizer_punct = punctuation_metrics(complementizer_source, complementizer_words)
+    colon_boundary = next(b for b in complementizer_punct["boundaries"]
+                          if b["kind"] == "colon_semicolon")
+    check("colon before a lowercase 'that' complement clause is advisory only",
+          colon_boundary["colon_complementizer_that"] is True and
+          colon_boundary["threshold_s"] is None and colon_boundary["passed"] is None,
+          repr(colon_boundary))
+    list_colon_source = "He listed the ingredients: flour, sugar, and salt."
+    list_colon_words = [
+        {"text": t, "start": i * 0.3, "end": i * 0.3 + 0.05}
+        for i, t in enumerate(tokenize(list_colon_source))
+    ]
+    list_colon_punct = punctuation_metrics(list_colon_source, list_colon_words)
+    list_colon_boundary = next(b for b in list_colon_punct["boundaries"]
+                               if b["kind"] == "colon_semicolon")
+    check("colon before a list keeps the 100ms threshold",
+          list_colon_boundary["colon_complementizer_that"] is False and
+          list_colon_boundary["threshold_s"] == PUNCTUATION_THRESHOLDS["colon_semicolon"],
+          repr(list_colon_boundary))
+    capitalized_that_source = "She insisted: That decision was final."
+    capitalized_that_words = [
+        {"text": t, "start": i * 0.3, "end": i * 0.3 + 0.05}
+        for i, t in enumerate(tokenize(capitalized_that_source))
+    ]
+    capitalized_that_punct = punctuation_metrics(capitalized_that_source, capitalized_that_words)
+    capitalized_that_boundary = next(b for b in capitalized_that_punct["boundaries"]
+                                     if b["kind"] == "colon_semicolon")
+    check("colon before capitalized 'That' (independent clause) keeps the 100ms threshold",
+          capitalized_that_boundary["colon_complementizer_that"] is False and
+          capitalized_that_boundary["threshold_s"] == PUNCTUATION_THRESHOLDS["colon_semicolon"],
+          repr(capitalized_that_boundary))
 
     short_words = words[:2] + words[3:]
     diagnostic = punctuation_metrics(source, short_words)
