@@ -28,7 +28,7 @@ Record schema (all values JSON-native):
     transcript, transcript_normalized, asr_tokens,
     confidence: {avg_logprob, no_speech_prob, compression_ratio},
     coverage: {expected_tokens, matched_tokens, fraction, missing},
-    mandatory: {items, missing, missing_fragile},
+    mandatory: {items, missing, missing_fragile, phonetic_matches},
     terminal: {expected, matched},
     repetition: {max_multiplicity, most_repeated, repeated_count}
     leakage: {flagged, detail},
@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v11-colon-complementizer"
+VALIDATION_POLICY = "paragraph-v12-phonetic-fragile"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -531,15 +531,97 @@ def is_fragile_mandatory(phrase: list) -> bool:
             and len(phrase[0]) <= FRAGILE_NUMBER_DIGITS_MAX)
 
 
+# --- phonetic-match demotion --------------------------------------------------
+# Whisper strongly prefers real words in its training vocabulary: a correctly
+# spoken RARE word ("decentre") predictably transcribes as its nearest common
+# neighbor ("dissenter", "desanter", "disantre" -- all independent draws of
+# the same word landed within one vowel of it). That is an ASR vocabulary
+# limitation, not evidence the word was missing from the audio, so a mandatory
+# word with a phonetically-adjacent transcript candidate demotes the same way
+# a bare number word does: reported, not hard-failed.
+PHONETIC_LENGTH_TOLERANCE = 0.4  # raw word lengths must be within this fraction
+_PHONETIC_C_BEFORE_EI_RE = re.compile(r"c(?=[ei])")
+_PHONETIC_DOUBLE_RE = re.compile(r"(.)\1+")
+_PHONETIC_VOWEL_RE = re.compile(r"[aeiouy]")
+
+
+def _phonetic_skeleton(word: str) -> str:
+    """Collapse a word to a coarse consonant skeleton so common digraph and
+    vowel-spelling differences ("decentre" / "dissenter") fall out: lowercase,
+    map digraphs towards their sound (ph->f, gh (silent) -> dropped, ck->k,
+    c->s before e/i else k, x->ks), collapse doubled letters, then drop
+    vowels except a leading one (which carries the word's opening sound)."""
+    w = word.lower()
+    w = w.replace("ph", "f")
+    w = w.replace("gh", "")
+    w = w.replace("ck", "k")
+    w = _PHONETIC_C_BEFORE_EI_RE.sub("s", w)
+    w = w.replace("c", "k")
+    w = w.replace("x", "ks")
+    w = _PHONETIC_DOUBLE_RE.sub(r"\1", w)
+    if w and w[0] in "aeiouy":
+        return w[0] + _PHONETIC_VOWEL_RE.sub("", w[1:])
+    return _PHONETIC_VOWEL_RE.sub("", w)
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+        prev = cur
+    return prev[-1]
+
+
+def _phonetic_match(word: str, candidate: str) -> bool:
+    """True when `candidate` is a plausible ASR mishearing of `word`: same
+    (or off-by-one, for long-enough skeletons) phonetic skeleton, the same
+    first letter, and comparable raw length. All three must hold -- this is
+    the precision guard against demoting a genuine content miss."""
+    if not word or not candidate or word == candidate:
+        return False
+    if word[0] != candidate[0]:
+        return False
+    w_skel, c_skel = _phonetic_skeleton(word), _phonetic_skeleton(candidate)
+    if w_skel == c_skel:
+        pass
+    elif len(w_skel) >= 4 and len(c_skel) >= 4 and _levenshtein(w_skel, c_skel) <= 1:
+        pass
+    else:
+        return False
+    longer, shorter = max(len(word), len(candidate)), min(len(word), len(candidate))
+    return shorter / longer >= (1 - PHONETIC_LENGTH_TOLERANCE)
+
+
+def _find_phonetic_match(word: str, asr: list) -> str:
+    """First ASR token that is a plausible mishearing of `word`, or None."""
+    for candidate in asr:
+        if _phonetic_match(word, candidate):
+            return candidate
+    return None
+
+
 def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_RATIO) -> dict:
     """Each mandatory item (string or token list) must appear as a contiguous,
-    fuzzy-tolerant run in the ASR tokens. Items flagged `is_fragile_mandatory`
-    (bare number-word markers) are reported in `missing_fragile` instead of
-    `missing`: they still count toward `coverage` (computed separately over
-    every expected token), but their absence alone never fails the verdict."""
+    fuzzy-tolerant run in the ASR tokens. An item flagged `is_fragile_mandatory`
+    (a bare number-word marker) or matched by `_find_phonetic_match` (a rare
+    word Whisper snapped to its nearest common neighbor, e.g. "decentre" ->
+    "dissenter") is reported in `missing_fragile` instead of `missing`: it
+    still counts toward `coverage` (computed separately over every expected
+    token), but its absence alone never fails the verdict. Phonetic matches
+    are additionally recorded in `phonetic_matches` (item -> matched ASR
+    word) so a later review can see every such acceptance."""
     items = []
     missing = []
     missing_fragile = []
+    phonetic_matches = {}
     for item in mandatory:
         raw_phrase = item if isinstance(item, str) else " ".join(map(str, item))
         phrase = tokenize(raw_phrase)
@@ -547,9 +629,20 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
             continue
         label = item if isinstance(item, str) else " ".join(map(str, item))
         items.append(label)
-        if not _phrase_in(asr, phrase, ratio):
-            (missing_fragile if is_fragile_mandatory(phrase) else missing).append(label)
-    return {"items": items, "missing": missing, "missing_fragile": missing_fragile}
+        if _phrase_in(asr, phrase, ratio):
+            continue
+        if is_fragile_mandatory(phrase):
+            missing_fragile.append(label)
+            continue
+        if len(phrase) == 1 and phrase[0].isalpha():
+            match = _find_phonetic_match(phrase[0], asr)
+            if match:
+                missing_fragile.append(label)
+                phonetic_matches[label] = match
+                continue
+        missing.append(label)
+    return {"items": items, "missing": missing, "missing_fragile": missing_fragile,
+            "phonetic_matches": phonetic_matches}
 
 
 def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
@@ -965,6 +1058,7 @@ class AsrValidator:
             "asr_tokens": asr_tokens,
             "confidence": metrics["confidence"],
             "coverage": metrics["coverage"],
+            "mandatory": metrics["mandatory"],
             "terminal": metrics["terminal"],
             "words": metrics["words"],
             "word_timings": word_timings,
@@ -1199,6 +1293,45 @@ def selfcheck() -> int:
     })
     check("list-marker paragraph passes despite missing bare number word",
           list_marker_verdict[0] == "PASS", repr(list_marker_verdict))
+
+    # Phonetic-match demotion: Whisper snaps a rare word to its nearest
+    # common neighbor ("decentre" -> "dissenter"/"desanter"/"disantre", all
+    # within one vowel of the source). A mandatory word with a
+    # phonetically-adjacent ASR candidate demotes to missing_fragile, same
+    # family as the bare-number-word demotion above -- reported, not
+    # hard-failed. A genuinely absent or phonetically unrelated word stays
+    # a hard miss (the precision guard).
+    check("decentre matches its real mishearing dissenter",
+          _phonetic_match("decentre", "dissenter"))
+    check("decentre matches its real mishearing desanter",
+          _phonetic_match("decentre", "desanter"))
+    check("decentre matches its real mishearing disantre",
+          _phonetic_match("decentre", "disantre"))
+    check("decentre does not match an unrelated word (demolish)",
+          not _phonetic_match("decentre", "demolish"))
+    check("europe does not match an unrelated word (erode)",
+          not _phonetic_match("europe", "erode"))
+    decentre_asr = tokenize(
+        "the saidian critique was part of a great sea change a conscious "
+        "attempt to dissenter europe or even to provincialize it")
+    decentre_mand = ["saidian", "critique", "change", "conscious", "attempt",
+                     "decentre", "europe", "provincialize"]
+    decentre_check = check_mandatory(decentre_asr, decentre_mand)
+    check("decentre/dissenter is not hard-mandatory",
+          decentre_check["missing"] == [], repr(decentre_check))
+    check("decentre/dissenter is recorded as fragile with its phonetic match",
+          decentre_check["missing_fragile"] == ["decentre"] and
+          decentre_check["phonetic_matches"] == {"decentre": "dissenter"},
+          repr(decentre_check))
+    check("a mandatory word entirely absent (no candidate) stays hard-mandatory",
+          check_mandatory(tokenize("nothing at all related here"),
+                          ["decentre"])["missing"] == ["decentre"])
+    check("a phonetically unrelated substitution stays hard-mandatory",
+          check_mandatory(tokenize("a conscious attempt to demolish europe"),
+                          ["decentre"])["missing"] == ["decentre"])
+    check("europe swapped for the unrelated erode stays hard-mandatory",
+          check_mandatory(tokenize("the attempt to decentre erode entirely"),
+                          ["europe"])["missing"] == ["europe"])
 
     check("terminal suffix present",
           terminal_suffix(tokenize("the history attempts to explain"),

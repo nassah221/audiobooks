@@ -548,6 +548,14 @@ class Adjudicator:
                     entry["raw_reasons"] = rec.get("reasons")
                     entry["asr_model"] = rec.get("asr")
                     entry["asr_policy"] = rec.get("validation_policy")
+                    phonetic_matches = (rec.get("mandatory") or {}).get("phonetic_matches")
+                    if phonetic_matches:
+                        # asr.py accepted a mandatory word on a phonetic-match
+                        # demotion (e.g. "decentre" heard as "dissenter") --
+                        # surface every one here for morning review, since the
+                        # strict gate already passed and this take never
+                        # reaches the lenient_coverage path below.
+                        entry["mandatory_phonetic_matches"] = phonetic_matches
                 fh.write(json.dumps(entry) + "\n")
 
     def concatenate(self):
