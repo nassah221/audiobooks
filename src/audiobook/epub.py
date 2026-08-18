@@ -435,7 +435,7 @@ def normalize_paragraph(text: str) -> str:
 
 
 _ABBREVIATIONS = {
-    "a.m.", "cf.", "dr.", "e.g.", "etc.", "fig.", "i.e.", "mr.",
+    "a.m.", "c.", "cf.", "dr.", "e.g.", "etc.", "fig.", "i.e.", "mr.",
     "mrs.", "ms.", "no.", "nos.", "p.", "p.m.", "pp.", "prof.",
     "st.", "vol.", "vs.",
 }

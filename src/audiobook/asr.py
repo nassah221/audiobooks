@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v14-semicolon-conjunction"
+VALIDATION_POLICY = "paragraph-v15-circa-abbreviation"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -1462,6 +1462,13 @@ def selfcheck() -> int:
                            if b["kind"] == "sentence_end"]
     check("initials abbreviation (U.S.) produces exactly one real sentence end",
           len(initials_boundaries) == 1, repr(initials_boundaries))
+    circa_source = ("Until c. eighteen hundred it looked as if a variety of "
+                     "factors would prevent a similar pattern in other parts "
+                     "of the world.")
+    circa_boundaries = [b for b in _source_punctuation_boundaries(circa_source)
+                        if b["kind"] == "sentence_end"]
+    check("circa abbreviation (c.) produces exactly one real sentence end",
+          len(circa_boundaries) == 1, repr(circa_boundaries))
 
     # A colon introducing a complement clause ("held good: that European
     # depictions...") reads straight through -- exempt from the 100ms
