@@ -63,7 +63,7 @@ from collections import Counter
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v8-list-markers"
+VALIDATION_POLICY = "paragraph-v9-decade-ellipsis"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -121,6 +121,35 @@ _DECADE_SUFFIXES = {
 }
 _DECADE_PREFIXES = {str(n): str(n) for n in range(10, 20)}
 _CENTURY_PREFIXES = {str(n): str(n * 100) for n in range(10, 20)}
+
+# Bare decade word <-> digit-form equivalence, independent of any century
+# prefix. "the eighteen thirties and forties" merges "eighteen thirties"
+# into "1830s" (a prefix+suffix pair, see _merge_decade_tokens) but leaves
+# the elliptical second decade "forties" as a standalone word -- Whisper may
+# still render that one as a digit form ("40s"/"'40s"/"40's"). Both spellings
+# canonicalize to the same "NNs" token so the match is equivalence-based, not
+# a fragile exemption: the content is still required, just spelled either way.
+_BARE_DECADE_WORDS = {k: v for k, v in _DECADE_SUFFIXES.items() if not k.isdigit()}
+_BARE_DECADE_NUMERIC_RE = re.compile(r"^'?([2-9]0)'?s$")
+_DECADE_TOKEN_RE = re.compile(r"^\d+0s$")  # any canonical decade token ("40s", "1830s", ...)
+
+
+def _canonicalize_bare_decades(tokens: list) -> list:
+    """Canonicalize a standalone decade word or digit rendering to "NNs".
+
+    Runs after century/decade prefix merging, so an already-merged 4-digit
+    token ("1830s") is untouched; only a decade left bare by ellipsis or
+    written directly as digits gets normalized.
+    """
+    out = []
+    for token in tokens:
+        t = str(token)
+        if t in _BARE_DECADE_WORDS:
+            out.append(f"{_BARE_DECADE_WORDS[t]}s")
+            continue
+        m = _BARE_DECADE_NUMERIC_RE.fullmatch(t)
+        out.append(f"{m.group(1)}s" if m else token)
+    return out
 
 
 def _merge_century_tokens(tokens: list) -> list:
@@ -234,7 +263,7 @@ def tokenize(text: str) -> list:
             merged.append(tok)
     if run:
         merged.append("".join(run))
-    return _merge_century_tokens(_merge_decade_tokens(merged))
+    return _canonicalize_bare_decades(_merge_century_tokens(_merge_decade_tokens(merged)))
 
 
 
@@ -493,17 +522,20 @@ def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
 
 def derive_mandatory(expected_tokens: list) -> list:
     """Default mandatory content: digits plus content words (len >= 6, not
-    function words) from the expected text. Callers may pass an explicit
-    `mandatory` list to override. `check_mandatory` (not this function)
-    decides which of these items are hard-mandatory vs. ASR-fragile bare
-    number words -- both are returned here so fragile items still count
-    toward the returned candidate set."""
+    function words) from the expected text, plus canonical decade tokens
+    ("40s", "1830s", ...) -- alnum, so neither the digit nor the alpha branch
+    would otherwise catch them, but a decade is real content just like a
+    year. Callers may pass an explicit `mandatory` list to override.
+    `check_mandatory` (not this function) decides which of these items are
+    hard-mandatory vs. ASR-fragile bare number words -- both are returned
+    here so fragile items still count toward the returned candidate set."""
     out = []
     seen = set()
     for tok in expected_tokens:
         if tok in seen:
             continue
-        keep = tok.isdigit() or (len(tok) >= 6 and tok.isalpha() and tok not in _FUNCTION_WORDS)
+        keep = (tok.isdigit() or _DECADE_TOKEN_RE.fullmatch(tok)
+                or (len(tok) >= 6 and tok.isalpha() and tok not in _FUNCTION_WORDS))
         if keep:
             seen.add(tok)
             out.append(tok)
@@ -1037,6 +1069,36 @@ def selfcheck() -> int:
     check("decade equivalence reaches terminal",
           terminal_suffix(tokenize("born in thirteen thirties"),
                           tokenize("born in 1330s"))["matched"])
+
+    # Bare decade word <-> digit-form equivalence (no century prefix), e.g.
+    # an elliptical list "the eighteen thirties and forties" where the
+    # second decade is never paired with its own prefix. This is a real
+    # matching equivalence (like century/decade above): the mandatory item
+    # still has to be present, just spelled either way -- not a fragile
+    # exemption.
+    check("bare decade word equals its digit form",
+          tokenize("forties") == tokenize("40s") == ["40s"])
+    check("bare decade apostrophe variants equal the digit form",
+          tokenize("'40s") == tokenize("40's") == tokenize("40s") == ["40s"])
+    check("nearby bare decade remains distinct",
+          tokenize("thirties") != tokenize("40s"))
+    check("elliptical decade list keeps the merged prefix decade distinct",
+          tokenize("the eighteen thirties and forties") ==
+          ["the", "1830s", "and", "40s"],
+          repr(tokenize("the eighteen thirties and forties")))
+    check("bare decade word reaches mandatory as its digit form",
+          check_mandatory(tokenize("the 40s were turbulent"), ["forties"])["missing"] == [])
+    check("bare decade digit form reaches mandatory as the word",
+          check_mandatory(tokenize("the forties were turbulent"), ["40s"])["missing"] == [])
+    check("unrelated missing content word still hard-fails",
+          check_mandatory(tokenize("nothing relevant here"),
+                          ["catastrophe"])["missing"] == ["catastrophe"])
+    decade_expected = tokenize("the eighteen thirties and forties were turbulent")
+    decade_asr = tokenize("the eighteen thirties and 40s were turbulent")
+    check("elliptical decade paragraph is fully mandatory-covered despite the digit rendering",
+          check_mandatory(decade_asr, derive_mandatory(decade_expected))["missing"] == [],
+          repr(check_mandatory(decade_asr, derive_mandatory(decade_expected))))
+
     check("ordinal range through thirty-first",
           tokenize("twenty-first") == tokenize("21st") and
           tokenize("thirty-first") == tokenize("31st"))
