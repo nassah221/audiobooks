@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v12-phonetic-fragile"
+VALIDATION_POLICY = "paragraph-v13-hundred-quantity"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -122,7 +122,12 @@ _DECADE_SUFFIXES = {
     "70": "70", "80": "80", "90": "90",
 }
 _DECADE_PREFIXES = {str(n): str(n) for n in range(10, 20)}
-_CENTURY_PREFIXES = {str(n): str(n * 100) for n in range(10, 20)}
+# "N hundred" multiplies by 100 for two distinct, equally idiomatic English
+# uses: a century/year reference ("fourteen hundred" = 1400, teens 10-19)
+# and a plain quantity ("three hundred years" = 300, single digits 1-9).
+# A non-teen two-digit prefix ("twenty hundred") is neither -- English says
+# "two thousand" instead -- so it stays out of this table and un-merged.
+_CENTURY_PREFIXES = {str(n): str(n * 100) for n in range(1, 20)}
 
 # Bare decade word <-> digit-form equivalence, independent of any century
 # prefix. "the eighteen thirties and forties" merges "eighteen thirties"
@@ -155,7 +160,10 @@ def _canonicalize_bare_decades(tokens: list) -> list:
 
 
 def _merge_century_tokens(tokens: list) -> list:
-    """Canonicalize spoken ``fourteen hundred`` and written ``1400``."""
+    """Canonicalize spoken ``fourteen hundred``/``1400`` and spoken
+    ``three hundred``/``300`` -- Whisper renders both a century and a plain
+    hundred-quantity as digits, so the mandatory/coverage checks need them
+    to agree regardless of which the source text spelled out."""
     merged = []
     i = 0
     while i < len(tokens):
@@ -1181,6 +1189,20 @@ def selfcheck() -> int:
           tokenize("twenty hundred") != tokenize("2000"))
     check("plural hundred remains distinct",
           tokenize("fourteen hundreds") != tokenize("1400"))
+
+    # "N hundred" as a plain quantity ("three hundred years" = 300 years),
+    # not a century reference, for single-digit prefixes one-nine.
+    check("spoken hundred-quantity equals written digits",
+          tokenize("three hundred years") == tokenize("300 years"))
+    check("hundred-quantity equivalence reaches coverage",
+          ordered_coverage(tokenize("nearly three hundred years"),
+                           tokenize("nearly 300 years"))["missing"] == [])
+    check("hundred-quantity equivalence reaches mandatory",
+          check_mandatory(tokenize("nearly 300 years"), ["three hundred"])["missing"] == [])
+    check("hundred-quantity count continuation remains distinct",
+          tokenize("three hundred one") != tokenize("300"))
+    check("different hundred-quantity remains distinct",
+          tokenize("three hundred") != tokenize("four hundred"))
     check("tokenize lowercases + strips punctuation",
           tokenize("The DEATH, of Tamerlane!") == ["the", "death", "of", "tamerlane"])
     check("number words -> digits", tokenize("fourteen oh five") == ["1405"])
