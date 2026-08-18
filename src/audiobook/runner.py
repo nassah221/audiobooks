@@ -235,11 +235,14 @@ def run_fingerprint(cfg: Config, ref_wav_sha: str, ref_text_sha: str) -> str:
                   "seed": cfg.seed},
         "asr": {"repo": cfg.asr_repo, "revision": cfg.asr_revision},
         "planner": planner, "sample_rate": SAMPLE_RATE, "stream": False,
-        "generation": {"policy": "icl-eos-hold-v1",
+        "generation": {"policy": "icl-rolling-v1",
                        "eos_hold_frames": qwenfix.EOS_HOLD_FRAMES,
                        "tail_max_silence_seconds": qwenfix.TAIL_MAX_SILENCE_SECONDS,
                        "tail_fade_seconds": qwenfix.TAIL_FADE_SECONDS,
-                       "sibilant_high_frac_min": qwenfix.SIBILANT_HIGH_FRAC_MIN},
+                       "sibilant_high_frac_min": qwenfix.SIBILANT_HIGH_FRAC_MIN,
+                       "context_window_units": 1,
+                       "context_scope": "paragraph",
+                       "context_on_retry": False},
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -746,6 +749,10 @@ class Generator:
         self._records = self._load_records()
         self._attempt_failures = {}
         self._forced_parents = set()
+        # Last accepted unit, for rolling-context conditioning (in-memory
+        # only: generated codec frames are never persisted across runs, so
+        # a resumed run always starts with no context, even mid-paragraph).
+        self._rolling = None
         self._load_state()
 
     def _invalidate_forced_parent(self, parent: dict, *, persist=True) -> None:
@@ -902,6 +909,7 @@ class Generator:
             "seconds": record["seconds"],
             "terminal_silence_seconds": record["terminal_silence_seconds"],
             "tail_frame_peak": record.get("tail_frame_peak", 0.0),
+            "context_chunk_id": record.get("context_chunk_id"),
         }
         # Persist the record before state marks this unit done.
         self._save_records()
@@ -923,6 +931,41 @@ class Generator:
         digest = hashlib.sha256(f"{chunk_id}:{attempt}".encode()).digest()
         return (base + int.from_bytes(digest[:4], "big")) % (2 ** 32)
 
+    @staticmethod
+    def _rolling_context_for(rolling: dict | None, chunk: dict) -> dict | None:
+        """Rolling-context policy: condition on the last accepted unit only
+        when it is in the same chapter and paragraph as `chunk` (a window of
+        one previous unit). Returns None otherwise — including when there is
+        no rolling state yet (start of a chapter run) or the chunk starts a
+        new paragraph, which is the "reset" case: no explicit state mutation
+        is needed because the mismatch already excludes the stale unit.
+        """
+        if rolling is None:
+            return None
+        if rolling["chapter"] != chunk["chapter"]:
+            return None
+        if rolling["paragraph_index"] != chunk["paragraph_index"]:
+            return None
+        return rolling
+
+    def _accept_rolling(self, record: dict) -> None:
+        """Track the last accepted unit for rolling-context conditioning.
+
+        Only called for takes that passed structural gates and validation
+        (see `_generate_with_retries`/`run`), so a rejected take never
+        poisons the chain.
+        """
+        codes = record.get("_gen_codes")
+        if codes is None:
+            return
+        self._rolling = {
+            "chunk_id": record["id"],
+            "paragraph_index": record["paragraph_index"],
+            "chapter": record["chapter"],
+            "text": record["text"],
+            "codes": codes,
+        }
+
     def _ref_audio_array(self):
         """Reference waveform as an mx.array, loaded once per run."""
         if getattr(self, "_ref_audio_mx", None) is None:
@@ -936,7 +979,8 @@ class Generator:
             self._ref_audio_mx = mx.array(np.asarray(data, dtype=np.float32))
         return self._ref_audio_mx
 
-    def _generate(self, chunk: dict, model, attempt: int = 0) -> dict:
+    def _generate(self, chunk: dict, model, attempt: int = 0,
+                  context: dict | None = None) -> dict:
         import mlx.core as mx
 
         inv = _invocation(self.config)
@@ -945,9 +989,10 @@ class Generator:
         t0 = time.perf_counter()
         seed = self._seed(inv["seed"], chunk["id"], attempt)
         mx.random.seed(seed)
-        audio = qwenfix.generate_icl_tail_safe(
+        context_arg = (context["text"], context["codes"]) if context is not None else None
+        audio, gen_codes = qwenfix.generate_icl_tail_safe(
             model, chunk["text"], self._ref_audio_array(), self.ref_text,
-            inv["lang_code"], inv["max_tokens"])
+            inv["lang_code"], inv["max_tokens"], context=context_arg)
         gen_seconds = time.perf_counter() - t0
         import numpy as np
         import soundfile as sf
@@ -999,6 +1044,12 @@ class Generator:
             "reference_wav_sha256": self.ref_wav_sha,
             "reference_text_sha256": self.ref_text_sha,
             "seed": seed, "attempt": attempt, "started_unix": time.time(),
+            "context_chunk_id": context["chunk_id"] if context is not None else None,
+            # Internal only: the generated codec frames, kept for a possible
+            # rolling-context handoff to the next chunk. Never persisted —
+            # excluded from state.json/records.json by the explicit field
+            # lists those write.
+            "_gen_codes": gen_codes,
         }
     def _validate_chunk(self, chunk: dict, record: dict):
         """Validate one take without checkpointing its verdict."""
@@ -1030,14 +1081,22 @@ class Generator:
         final sibilant) can only be fixed by another draw and get the full
         attempt budget; ASR validation failures fall back to clause
         splitting after two, as before.
+
+        Only the first attempt is conditioned on rolling context (the last
+        accepted unit in this paragraph, if any): a rejected take must not
+        poison the chain, and dropping context on retry removes it as a
+        failure variable, so every attempt after the first generates as if
+        there were no previous chunk.
         """
         failures = []
         validation_failures = 0
+        base_context = self._rolling_context_for(getattr(self, "_rolling", None), chunk)
         for attempt in range(4):
             if validation_failures >= 2:
                 break
+            context = base_context if attempt == 0 else None
             try:
-                record = self._generate(chunk, model, attempt=attempt)
+                record = self._generate(chunk, model, attempt=attempt, context=context)
                 structural = None
                 if float(record.get("tail_frame_peak", 0.0)) > qwenfix.TAIL_FRAME_PEAK_MAX:
                     structural = "speech reaches into the room-tone tail"
@@ -1278,9 +1337,11 @@ class Generator:
                     if child_record is None:
                         raise self._retry_error(child, child_failures)
                     self._record_chunk(child_record)
+                    self._accept_rolling(child_record)
                     records.append(child_record)
             else:
                 self._record_chunk(record)
+                self._accept_rolling(record)
                 records = [record]
             gen_cum += sum(r["generation_seconds"] for r in records)
             audio_cum += sum(r["seconds"] for r in records)
@@ -1817,7 +1878,7 @@ def selfcheck() -> int:
         {"id": retry_child["id"], "attempt": 1, "tail_frame_peak": 0.0089,
          "terminal_silence_seconds": 0.24, "generation_seconds": 0.0, "seconds": 1.0},
     ]
-    retry_gen._generate = lambda chunk, model, attempt=0: (
+    retry_gen._generate = lambda chunk, model, attempt=0, context=None: (
         retry_attempts.append(attempt) or dict(retry_records[attempt]))
     retry_gen._validate_chunk = lambda chunk, record: {
         "verdict": "PASS", "reasons": [],
@@ -1835,7 +1896,7 @@ def selfcheck() -> int:
     gate_gen._records = {}
     gate_gen._attempt_failures = {}
     gate_gen.out_dir = pathlib.Path("/tmp")
-    gate_gen._generate = lambda chunk, model, attempt=0: {
+    gate_gen._generate = lambda chunk, model, attempt=0, context=None: {
         "id": chunk["id"], "tail_frame_peak": 0.24}
     rejected, gate_failures = gate_gen._generate_with_retries(retry_child, object())
     check("persistent truncation exhausts four takes",
@@ -1848,7 +1909,7 @@ def selfcheck() -> int:
     pass_gen._records = {}
     pass_gen._attempt_failures = {}
     pass_gen.out_dir = pathlib.Path("/tmp")
-    pass_gen._generate = lambda chunk, model, attempt=0: {
+    pass_gen._generate = lambda chunk, model, attempt=0, context=None: {
         "id": chunk["id"], "tail_frame_peak": 0.0089}
     positive, positive_failures = pass_gen._generate_with_retries(retry_child, object())
     check("room-tone tail passes", positive is not None and not positive_failures)
@@ -1862,7 +1923,7 @@ def selfcheck() -> int:
     sib_gen._records = {}
     sib_gen._attempt_failures = {}
     sib_gen.out_dir = pathlib.Path("/tmp")
-    sib_gen._generate = lambda chunk, model, attempt=0: {
+    sib_gen._generate = lambda chunk, model, attempt=0, context=None: {
         "id": chunk["id"], "tail_frame_peak": 0.001,
         "final_sibilant_high_frac": 0.012}
     sib_rejected, sib_failures = sib_gen._generate_with_retries(retry_child, object())
@@ -1875,7 +1936,7 @@ def selfcheck() -> int:
     fail_gen._attempt_failures = {}
     fail_gen.out_dir = pathlib.Path("/tmp")
     fail_attempts = []
-    fail_gen._generate = lambda chunk, model, attempt=0: (
+    fail_gen._generate = lambda chunk, model, attempt=0, context=None: (
         fail_attempts.append(attempt) or dict(retry_records[1], attempt=attempt))
     fail_gen._validate_chunk = lambda chunk, record: {
         "verdict": "FAIL", "reasons": ["punctuation pause failed"]}
@@ -1885,6 +1946,59 @@ def selfcheck() -> int:
           failed_record is None and fail_attempts == [0, 1]
           and "every retry attempt failed" in str(retry_error)
           and "punctuation pause failed" in str(retry_error))
+
+    # Rolling-context policy: a pure function of (last accepted unit, next chunk).
+    _rolling_p2 = {"chunk_id": "ch01:p0002:s0000", "paragraph_index": 2,
+                   "chapter": "ch01", "text": "prev text", "codes": "codes-obj"}
+    _chunk_p2b = {"id": "ch01:p0002:s0002", "chapter": "ch01", "paragraph_index": 2}
+    _chunk_p3 = {"id": "ch01:p0003:s0000", "chapter": "ch01", "paragraph_index": 3}
+    _chunk_ch2 = {"id": "ch02:p0002:s0000", "chapter": "ch02", "paragraph_index": 2}
+    check("rolling context used within same paragraph",
+          Generator._rolling_context_for(_rolling_p2, _chunk_p2b) == _rolling_p2)
+    check("rolling context reset on paragraph change",
+          Generator._rolling_context_for(_rolling_p2, _chunk_p3) is None)
+    check("rolling context reset on chapter change",
+          Generator._rolling_context_for(_rolling_p2, _chunk_ch2) is None)
+    check("rolling context absent with no prior unit",
+          Generator._rolling_context_for(None, _chunk_p2b) is None)
+
+    # Integration: `_generate_with_retries` uses context on attempt 0 only —
+    # a rejected first take must not carry its (possibly bad) context into
+    # the retry, and the retry itself must not use context either.
+    ctx_gen = object.__new__(Generator)
+    ctx_gen.validate = False
+    ctx_gen._records = {}
+    ctx_gen._attempt_failures = {}
+    ctx_gen.out_dir = pathlib.Path("/tmp")
+    ctx_gen._rolling = _rolling_p2
+    ctx_calls = []
+
+    def _ctx_generate(chunk, model, attempt=0, context=None):
+        ctx_calls.append(context)
+        peak = 0.24 if attempt == 0 else 0.0089  # fail attempt 0, pass attempt 1
+        return {"id": chunk["id"], "tail_frame_peak": peak}
+
+    ctx_gen._generate = _ctx_generate
+    ctx_record, ctx_failures = ctx_gen._generate_with_retries(_chunk_p2b, object())
+    check("context used on first attempt only, dropped on retry",
+          ctx_record is not None and len(ctx_calls) == 2
+          and ctx_calls[0] == _rolling_p2 and ctx_calls[1] is None)
+
+    # _accept_rolling only tracks accepted takes that produced codec frames.
+    accept_gen = object.__new__(Generator)
+    accept_gen._rolling = None
+    accept_gen._accept_rolling({
+        "id": "ch01:p0002:s0002", "paragraph_index": 2, "chapter": "ch01",
+        "text": "Second chunk.", "_gen_codes": "codes-obj",
+    })
+    check("accepted take becomes rolling context",
+          accept_gen._rolling == {
+              "chunk_id": "ch01:p0002:s0002", "paragraph_index": 2,
+              "chapter": "ch01", "text": "Second chunk.", "codes": "codes-obj"})
+    accept_gen._accept_rolling({"id": "x", "paragraph_index": 2, "chapter": "ch01",
+                                 "text": "no codes"})
+    check("record without codes leaves rolling context unchanged",
+          accept_gen._rolling["chunk_id"] == "ch01:p0002:s0002")
 
     failed = [name for name, ok in results if not ok]
     print(f"selfcheck: {len(results) - len(failed)}/{len(results)} passed")
