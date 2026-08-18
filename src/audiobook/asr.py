@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v19-hundred-and-remainder"
+VALIDATION_POLICY = "paragraph-v20-hyphen-phrase-derivation"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -139,6 +139,7 @@ _CENTURY_PREFIXES = {str(n): str(n * 100) for n in range(1, 20)}
 _BARE_DECADE_WORDS = {k: v for k, v in _DECADE_SUFFIXES.items() if not k.isdigit()}
 _BARE_DECADE_NUMERIC_RE = re.compile(r"^'?([2-9]0)'?s$")
 _DECADE_TOKEN_RE = re.compile(r"^\d+0s$")  # any canonical decade token ("40s", "1830s", ...)
+_HYPHENATED_WORD_RE = re.compile(r"\b[a-zA-Z]+-[a-zA-Z]+\b")
 
 
 def _canonicalize_bare_decades(tokens: list) -> list:
@@ -786,7 +787,7 @@ def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
     }
 
 
-def derive_mandatory(expected_tokens: list) -> list:
+def derive_mandatory(expected_tokens: list, expected_text: str = None) -> list:
     """Default mandatory content: digits plus content words (len >= 6, not
     function words) from the expected text, plus canonical decade tokens
     ("40s", "1830s", ...) -- alnum, so neither the digit nor the alpha branch
@@ -794,17 +795,39 @@ def derive_mandatory(expected_tokens: list) -> list:
     year. Callers may pass an explicit `mandatory` list to override.
     `check_mandatory` (not this function) decides which of these items are
     hard-mandatory vs. ASR-fragile bare number words -- both are returned
-    here so fragile items still count toward the returned candidate set."""
+    here so fragile items still count toward the returned candidate set.
+
+    When `expected_text` is given, a two-part hyphenated compound word
+    ("strong-points") whose combined letters qualify as content (>= 6) is
+    added as ONE phrase item (its tokenize()'d halves), replacing its
+    individual halves in the per-token derivation below. tokenize() splits
+    a hyphen into separate tokens, so without this, "strong" and "points"
+    would each be checked alone and neither matches Whisper's solid
+    rendering ("strongpoints") -- only a phrase-level mandatory item lets
+    check_mandatory's hyphen-boundary equivalence (_concat_match) see them
+    as one unit and match the concatenation."""
+    hyphen_phrases = []
+    excluded = set()
+    if expected_text:
+        for m in _HYPHENATED_WORD_RE.finditer(expected_text):
+            parts = tokenize(m.group(0))
+            if len(parts) >= 2 and sum(len(p) for p in parts) >= 6:
+                hyphen_phrases.append(" ".join(parts))
+                excluded.update(parts)
     out = []
     seen = set()
     for tok in expected_tokens:
-        if tok in seen:
+        if tok in seen or tok in excluded:
             continue
         keep = (tok.isdigit() or _DECADE_TOKEN_RE.fullmatch(tok)
                 or (len(tok) >= 6 and tok.isalpha() and tok not in _FUNCTION_WORDS))
         if keep:
             seen.add(tok)
             out.append(tok)
+    for phrase in hyphen_phrases:
+        if phrase not in seen:
+            seen.add(phrase)
+            out.append(phrase)
     return out
 
 
@@ -1165,7 +1188,7 @@ class AsrValidator:
         asr_tokens = tokenize(transcript)
         expected_tokens = tokenize(expected_text)
         word_timings = normalized_word_timings(segments)
-        mand_items = derive_mandatory(expected_tokens) if mandatory is None else mandatory
+        mand_items = derive_mandatory(expected_tokens, expected_text) if mandatory is None else mandatory
         metrics = {
             "coverage": ordered_coverage(expected_tokens, asr_tokens),
             "mandatory": check_mandatory(asr_tokens, mand_items),
@@ -1561,6 +1584,32 @@ def selfcheck() -> int:
     check("unrelated words stay hard failures under concatenation matching",
           check_mandatory(tokenize("a conscious attempt to demolish europe"),
                           ["southeastward"])["missing"] == ["southeastward"])
+
+    # derive_mandatory itself must turn a hyphenated source compound into
+    # ONE phrase item, not two independent atomic tokens -- otherwise each
+    # half is checked alone and neither matches Whisper's solid rendering
+    # ("strongpoints"), even though check_mandatory's hyphen equivalence
+    # (_concat_match) exists: two atomic single-token items never combine
+    # into the multi-token phrase that equivalence needs.
+    strongpoints_text = ("their fortified strong-points, became the "
+                          "building blocks for a new round of state-making.")
+    strongpoints_expected = tokenize(strongpoints_text)
+    strongpoints_mandatory = derive_mandatory(strongpoints_expected, strongpoints_text)
+    check("hyphenated compound becomes one phrase item, not two atomic tokens",
+          "strong points" in strongpoints_mandatory and
+          "strong" not in strongpoints_mandatory and "points" not in strongpoints_mandatory,
+          repr(strongpoints_mandatory))
+    strongpoints_check = check_mandatory(
+        tokenize("their fortified strongpoints, became the building blocks "
+                 "for a new round of state-making."),
+        strongpoints_mandatory)
+    check("derive_mandatory hyphen phrase reaches a full mandatory pass",
+          strongpoints_check["missing"] == [] and
+          strongpoints_check["hyphen_matches"].get("strong points") == "strongpoints",
+          repr(strongpoints_check))
+    check("derive_mandatory without expected_text keeps the old atomic behavior",
+          derive_mandatory(tokenize("The death of Tamerlane in 1405 was a turning point."))
+          == ["tamerlane", "1405", "turning"])
 
     check("terminal suffix present",
           terminal_suffix(tokenize("the history attempts to explain"),
