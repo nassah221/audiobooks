@@ -66,7 +66,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v23-curated-transliteration-pairs"
+VALIDATION_POLICY = "paragraph-v24-possessive-hyphen-phrase"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -140,7 +140,7 @@ _CENTURY_PREFIXES = {str(n): str(n * 100) for n in range(1, 20)}
 _BARE_DECADE_WORDS = {k: v for k, v in _DECADE_SUFFIXES.items() if not k.isdigit()}
 _BARE_DECADE_NUMERIC_RE = re.compile(r"^'?([2-9]0)'?s$")
 _DECADE_TOKEN_RE = re.compile(r"^\d+0s$")  # any canonical decade token ("40s", "1830s", ...)
-_HYPHENATED_WORD_RE = re.compile(r"\b[a-zA-Z]+-[a-zA-Z]+\b")
+_HYPHENATED_WORD_RE = re.compile(r"\b[a-zA-Z]+-[a-zA-Z]+(?:'s)?\b")
 
 
 def _canonicalize_bare_decades(tokens: list) -> list:
@@ -1782,6 +1782,22 @@ def selfcheck() -> int:
     check("derive_mandatory without expected_text keeps the old atomic behavior",
           derive_mandatory(tokenize("The death of Tamerlane in 1405 was a turning point."))
           == ["tamerlane", "1405", "turning"])
+
+    # A possessive on the hyphenated compound's second half ("Cheng-ho's")
+    # must be captured as part of the phrase, not dropped at the hyphen --
+    # tokenize() already renders "Cheng-ho's" and "Cheng Ho's" identically
+    # (["cheng", "ho's"]), so excluding the "'s" here would manufacture a
+    # mismatch against a transcript that never differed in the first place.
+    chengho_text = "The abandonment of Cheng-ho's maritime ventures signalled the problem."
+    chengho_expected = tokenize(chengho_text)
+    chengho_mandatory = derive_mandatory(chengho_expected, chengho_text)
+    check("possessive hyphenated compound keeps its 's in the phrase",
+          "cheng ho's" in chengho_mandatory, repr(chengho_mandatory))
+    chengho_check = check_mandatory(
+        tokenize("The abandonment of Cheng Ho's maritime ventures signalled the problem."),
+        chengho_mandatory)
+    check("possessive hyphenated compound matches the transcript's spaced form",
+          chengho_check["missing"] == [], repr(chengho_check))
 
     # v21: a single canonicalization (ise/ize spelling + compound/adjacency
     # concatenation) applied to both source and transcript token streams,
