@@ -300,6 +300,19 @@ def selfcheck() -> int:
         "signal": {"full_scale_samples": 0}, "words": {"max_internal_gap_s": 0.1}})
     check("marginal confidence flagged without override", not hp and any("avg_logprob" in r for r in reasons))
 
+    # A unit the live runner already omitted (no letters, e.g. a bare "*"
+    # section break -- runner.is_unspeakable) classifies as OMIT_UNSPEAKABLE
+    # immediately, without needing a wav at all: the ledger reads the same
+    # whether the live path or this post-hoc path made the call.
+    omit_adj = Adjudicator.__new__(Adjudicator)
+    omit_adj.done = {"ch01:p0005:s0000-0001": {"text_sha256": "x", "omitted": True,
+                                               "omit_reason": "OMIT_UNSPEAKABLE"}}
+    omit_chunk = {"id": "ch01:p0005:s0000-0001", "text": "*", "text_sha256": "x"}
+    omit_decision = omit_adj._classify_unit(omit_chunk, omit_chunk)
+    check("live-omitted unit classifies as OMIT_UNSPEAKABLE without a wav",
+          omit_decision[1] is None and omit_decision[3] == "OMIT_UNSPEAKABLE",
+          repr(omit_decision))
+
     # Parent fallback must assemble its ordered children and publish the WAV.
     import struct
     import tempfile
@@ -427,6 +440,11 @@ class Adjudicator:
         text = chunk.get("text")
         expected_hash = runner.sha256_text(text) if isinstance(text, str) else None
         done = self.done.get(chunk_id)
+        if done and done.get("omitted"):
+            # The live runner already made this call before ever attempting
+            # TTS (runner.is_unspeakable) -- same decision, same reason, so
+            # the ledger reads identically to the post-hoc path below.
+            return (chunk, None, None, "OMIT_UNSPEAKABLE", ["non-speech text"])
         if not done or not done.get("wav"):
             return (chunk, None, None, "BLOCK_MISSING", ["unit WAV not generated"])
         if not isinstance(text, str) or expected_hash != chunk.get("text_sha256"):
@@ -439,7 +457,7 @@ class Adjudicator:
         actual_wav_sha = _sha256(wav)
         if done.get("wav_sha256") != actual_wav_sha:
             return (chunk, wav, None, "BLOCK_STALE_WAV", ["checkpoint WAV hash mismatch"])
-        if not re.search(r"[A-Za-z]", text):
+        if runner.is_unspeakable(text):
             return (chunk, wav, None, "OMIT_UNSPEAKABLE", ["non-speech text"])
         rec = self.records.get(chunk_id)
         if rec is None or rec.get("chunk_id") != chunk_id:

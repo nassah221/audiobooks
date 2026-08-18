@@ -60,6 +60,19 @@ PILOT_SENTENCE = (
 # The Qwen API has no seed argument; generation uses MLX's global RNG.
 # Each paragraph attempt resets that RNG to a stable, distinct seed.
 CLAUSE_SPLIT_POLICY = "planned-strong-clause-v1"
+
+# Shared predicate for "this unit has nothing to pronounce" (a stray
+# formatting artifact like a bare "*" section-break marker). Single source
+# of truth for both the live generation skip below and adjudicate.py's
+# post-hoc OMIT_UNSPEAKABLE decision -- a unit with no letters is
+# unspeakable regardless of which path notices first.
+_UNSPEAKABLE_RE = re.compile(r"[A-Za-z]")
+
+
+def is_unspeakable(text: str) -> bool:
+    return not bool(_UNSPEAKABLE_RE.search(text or ""))
+
+
 REQUIRED_PUNCTUATION_KINDS = frozenset({
     "sentence_end", "sentence-ending", "sentence-ending-punctuation",
     "period", "question", "exclamation", ".", "?", "!",
@@ -889,6 +902,8 @@ class Generator:
         d = self.done.get(chunk["id"])
         if not d or d.get("text_sha256") != chunk["text_sha256"]:
             return False
+        if d.get("omitted"):
+            return True
         if float(d.get("tail_frame_peak", 0.0)) > qwenfix.TAIL_FRAME_PEAK_MAX:
             return False
         wav = self.out_dir / d["wav"]
@@ -903,17 +918,42 @@ class Generator:
         return bool(children) and all(self._unit_done(c) for c in children)
 
     def _record_chunk(self, record: dict) -> None:
-        self.done[record["id"]] = {
-            "text_sha256": record["text_sha256"], "wav": record["wav"],
-            "wav_sha256": record["wav_sha256"], "samples": record["samples"],
-            "seconds": record["seconds"],
-            "terminal_silence_seconds": record["terminal_silence_seconds"],
-            "tail_frame_peak": record.get("tail_frame_peak", 0.0),
-            "context_chunk_id": record.get("context_chunk_id"),
-        }
+        if record.get("omitted"):
+            self.done[record["id"]] = {
+                "text_sha256": record["text_sha256"],
+                "omitted": True,
+                "omit_reason": record.get("omit_reason", "OMIT_UNSPEAKABLE"),
+            }
+        else:
+            self.done[record["id"]] = {
+                "text_sha256": record["text_sha256"], "wav": record["wav"],
+                "wav_sha256": record["wav_sha256"], "samples": record["samples"],
+                "seconds": record["seconds"],
+                "terminal_silence_seconds": record["terminal_silence_seconds"],
+                "tail_frame_peak": record.get("tail_frame_peak", 0.0),
+                "context_chunk_id": record.get("context_chunk_id"),
+            }
         # Persist the record before state marks this unit done.
         self._save_records()
         self._save_state()
+
+    def _maybe_omit_unspeakable(self, chunk: dict) -> bool:
+        """Skip generation entirely for a unit with no alphabetic content (a
+        stray formatting artifact, e.g. a bare "*" section-break marker) --
+        there is nothing to synthesize, and attempting to would only ever
+        produce near-silent audio that fails the structural gate on every
+        retry. Mirrors adjudicate.py's post-hoc OMIT_UNSPEAKABLE decision,
+        but before ever calling the TTS model, so the audit trail this
+        produces is the one that overlay would have produced anyway.
+        Returns True (and records the omission) when the unit was skipped.
+        """
+        if not is_unspeakable(chunk["text"]):
+            return False
+        self._record_chunk({
+            "id": chunk["id"], "text_sha256": chunk["text_sha256"],
+            "omitted": True, "omit_reason": "OMIT_UNSPEAKABLE",
+        })
+        return True
 
     @staticmethod
     def _terminal_silence_seconds(audio) -> float:
@@ -1167,6 +1207,8 @@ class Generator:
             if children and all(self._unit_done(c) for c in children):
                 for child in children:
                     done = self.done[child["id"]]
+                    if done.get("omitted"):
+                        continue
                     if not self._record_ok(self._records.get(child["id"]),
                                            child["text_sha256"], done["wav_sha256"],
                                            self.config.asr_repo, self.config.asr_revision):
@@ -1176,6 +1218,8 @@ class Generator:
                 blocked.append(parent["id"])
                 continue
             done = self.done[parent["id"]]
+            if done.get("omitted"):
+                continue
             if not self._record_ok(self._records.get(parent["id"]),
                                    parent["text_sha256"], done["wav_sha256"],
                                    self.config.asr_repo, self.config.asr_revision):
@@ -1279,6 +1323,12 @@ class Generator:
                 done = self.done.get(chunk["id"])
                 if not done:
                     raise RunError(f"cannot concatenate: {chunk['id']} not generated")
+                if done.get("omitted"):
+                    # No audio to contribute (e.g. a bare "*" section break);
+                    # the normal inter-paragraph gap between its real
+                    # neighbors already carries that silence, so it is
+                    # simply left out rather than padded separately.
+                    continue
                 wav = self.out_dir / done["wav"]
                 if not wav.is_file():
                     raise RunError(f"cannot concatenate: {chunk['id']} wav missing ({wav})")
@@ -1326,6 +1376,9 @@ class Generator:
             print(f"  model loaded in {self.load_seconds:.1f}s; {total} chunk(s) to generate")
         gen_cum = audio_cum = 0.0
         for i, chunk in enumerate(pending, 1):
+            if self._maybe_omit_unspeakable(chunk):
+                print(f"  {chunk['id']}  omitted (non-speech text)  ({i}/{total})")
+                continue
             record, failures = self._generate_with_retries(chunk, self._model)
             if record is None:
                 children = self._child_chunks(chunk)
@@ -1333,6 +1386,8 @@ class Generator:
                     raise self._retry_error(chunk, failures)
                 records = []
                 for child in children:
+                    if self._maybe_omit_unspeakable(child):
+                        continue
                     child_record, child_failures = self._generate_with_retries(child, self._model)
                     if child_record is None:
                         raise self._retry_error(child, child_failures)
@@ -1415,7 +1470,7 @@ def validate_generated(root, out_dir, *, chapters=None, limit=None, config=None)
         candidates = [parent] if parent_done and parent_wav and parent_wav.is_file() else children
         for chunk in candidates:
             d = st.get("done", {}).get(chunk["id"])
-            if not d:
+            if not d or d.get("omitted") or not d.get("wav"):
                 continue
             wav = out_dir / d["wav"]
             if not wav.is_file():
@@ -1787,6 +1842,98 @@ def selfcheck() -> int:
               book.read_bytes() == Generator._wav_header_bytes(6) + a.read_bytes()[44:] + b.read_bytes()[44:])
         check("concatenation rejects wrong payload",
               not Generator._payload_bytes_equal(book, [a, a]))
+
+    # A unit with no letters (a stray "*" section-break marker) is omitted
+    # before ever attempting TTS -- the same OMIT_UNSPEAKABLE decision
+    # adjudicate.py would make post-hoc, just made earlier.
+    check("bare symbol is unspeakable", is_unspeakable("*"))
+    check("other letterless strings are unspeakable",
+          is_unspeakable("---") and is_unspeakable("1500") and is_unspeakable(""))
+    check("normal text is speakable", not is_unspeakable("The empire fell."))
+    check("digit-bearing prose is speakable",
+          not is_unspeakable("In 1500, the empire fell."))
+
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        omit_gen = object.__new__(Generator)
+        omit_gen.out_dir = td
+        omit_gen.validate = False
+        omit_gen._records = {}
+        omit_gen._save_records = lambda: None
+        omit_gen._save_state = lambda: None
+        omit_gen.done = {}
+        star_chunk = {"id": "ch01:p0005:s0000-0001", "text": "*",
+                      "text_sha256": sha256_text("*")}
+        prose_chunk = {"id": "ch01:p0006:s0000-0001", "text": "Real prose.",
+                       "text_sha256": sha256_text("Real prose.")}
+        check("omit helper records the unit and returns True",
+              omit_gen._maybe_omit_unspeakable(star_chunk) and
+              omit_gen.done[star_chunk["id"]] ==
+              {"text_sha256": star_chunk["text_sha256"], "omitted": True,
+               "omit_reason": "OMIT_UNSPEAKABLE"})
+        check("omit helper leaves normal text alone",
+              not omit_gen._maybe_omit_unspeakable(prose_chunk) and
+              prose_chunk["id"] not in omit_gen.done)
+        check("an omitted unit is done without ever having a wav",
+              omit_gen._unit_done(star_chunk))
+
+    # The release gate must not block on an omitted unit (no ASR record
+    # exists for it -- it was never generated, let alone validated).
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        gate_gen = object.__new__(Generator)
+        gate_gen.out_dir = td
+        gate_gen.validate = True
+        gate_gen._records = {}
+        gate_gen.config = type("Cfg", (), {"asr_repo": _ar, "asr_revision": _av})()
+        star_chunk = {"id": "ch01:p0007:s0000-0001", "text": "*",
+                      "text_sha256": sha256_text("*"), "eligible_clause_spans": []}
+        gate_gen.plan = {"chunks": [star_chunk]}
+        gate_gen.done = {star_chunk["id"]: {"text_sha256": star_chunk["text_sha256"],
+                                            "omitted": True, "omit_reason": "OMIT_UNSPEAKABLE"}}
+        check("release gate does not block an omitted unit",
+              gate_gen._release_gate() == {"release": True, "blocked": []})
+
+    # Assembly must skip an omitted unit's audio entirely -- the real
+    # neighbors on either side get exactly the padding their own paragraph
+    # relationship calls for, not doubled and not glued together.
+    with tempfile.TemporaryDirectory() as td:
+        import wave
+        td = pathlib.Path(td)
+        left_wav, right_wav = td / "left.wav", td / "right.wav"
+        _make_wav(left_wav, [1, 2, 3])
+        _make_wav(right_wav, [4, 5, 6])
+        left_chunk = {"id": "ch01:p0004:s0000-0001", "text": "Left.",
+                      "text_sha256": sha256_text("Left."), "chapter": "ch01",
+                      "paragraph_index": 4, "eligible_clause_spans": []}
+        star_chunk = {"id": "ch01:p0005:s0000-0001", "text": "*",
+                      "text_sha256": sha256_text("*"), "chapter": "ch01",
+                      "paragraph_index": 5, "eligible_clause_spans": []}
+        right_chunk = {"id": "ch01:p0006:s0000-0001", "text": "Right.",
+                       "text_sha256": sha256_text("Right."), "chapter": "ch01",
+                       "paragraph_index": 6, "eligible_clause_spans": []}
+        concat_gen = object.__new__(Generator)
+        concat_gen.out_dir = td
+        concat_gen.plan = {"chunks": [left_chunk, star_chunk, right_chunk]}
+        concat_gen.done = {
+            left_chunk["id"]: {"text_sha256": left_chunk["text_sha256"], "wav": left_wav.name,
+                               "wav_sha256": sha256_file(left_wav), "samples": 3,
+                               "terminal_silence_seconds": 0.0},
+            star_chunk["id"]: {"text_sha256": star_chunk["text_sha256"],
+                               "omitted": True, "omit_reason": "OMIT_UNSPEAKABLE"},
+            right_chunk["id"]: {"text_sha256": right_chunk["text_sha256"], "wav": right_wav.name,
+                                "wav_sha256": sha256_file(right_wav), "samples": 3,
+                                "terminal_silence_seconds": 0.0},
+        }
+        manifest = concat_gen._concatenate()
+        book_wav = td / BOOK_WAV_REL
+        expected_pad = Generator._boundary_padding_frames(left_chunk, left_wav, right_chunk, right_wav)
+        with wave.open(str(book_wav), "rb") as fh:
+            payload = struct.unpack("<%dh" % fh.getnframes(), fh.readframes(fh.getnframes()))
+        check("omitted unit contributes no audio and no separate padding",
+              manifest["inserted_silence_samples"] == expected_pad and
+              payload == (1, 2, 3) + (0,) * expected_pad + (4, 5, 6),
+              repr((manifest["inserted_silence_samples"], expected_pad, len(payload))))
 
     # Child fallback must assemble children when the parent has no checkpoint.
     with tempfile.TemporaryDirectory() as td:
