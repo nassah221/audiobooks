@@ -28,7 +28,7 @@ Record schema (all values JSON-native):
     transcript, transcript_normalized, asr_tokens,
     confidence: {avg_logprob, no_speech_prob, compression_ratio},
     coverage: {expected_tokens, matched_tokens, fraction, missing},
-    mandatory: {items, missing, missing_fragile, phonetic_matches},
+    mandatory: {items, missing, missing_fragile, phonetic_matches, hyphen_matches},
     terminal: {expected, matched},
     repetition: {max_multiplicity, most_repeated, repeated_count}
     leakage: {flagged, detail},
@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v16-century-block"
+VALIDATION_POLICY = "paragraph-v17-hyphen-equivalence"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -656,20 +656,51 @@ def _find_phonetic_match(word: str, asr: list) -> str:
     return None
 
 
+def _concat_match(phrase: list, asr: list) -> str:
+    """Exact hyphen-boundary match for a mandatory item, in either
+    direction: adjacent ASR tokens concatenating to equal a single-token
+    mandatory word ("southeastward" <- "south" + "eastward"), or a
+    multi-token mandatory phrase (from a hyphenated source word tokenize()
+    split) concatenating to equal a single ASR token (the reverse). A
+    hyphen changes spelling, never sound, so this is exact string equality
+    on adjacent tokens only -- a real content match, not a fuzzy or fragile
+    one. Returns the matched ASR span (space-joined) or None."""
+    if len(phrase) == 1:
+        word = phrase[0]
+        for i in range(len(asr)):
+            acc = ""
+            for j in range(i, len(asr)):
+                acc += asr[j]
+                if acc == word:
+                    return " ".join(asr[i:j + 1])
+                if len(acc) >= len(word):
+                    break
+        return None
+    target = "".join(phrase)
+    for tok in asr:
+        if tok == target:
+            return tok
+    return None
+
+
 def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_RATIO) -> dict:
     """Each mandatory item (string or token list) must appear as a contiguous,
-    fuzzy-tolerant run in the ASR tokens. An item flagged `is_fragile_mandatory`
+    fuzzy-tolerant run in the ASR tokens, or match across a hyphen boundary
+    (`_concat_match`) -- the latter counts as a full, non-fragile match since
+    a hyphen never changes pronunciation. An item flagged `is_fragile_mandatory`
     (a bare number-word marker) or matched by `_find_phonetic_match` (a rare
     word Whisper snapped to its nearest common neighbor, e.g. "decentre" ->
     "dissenter") is reported in `missing_fragile` instead of `missing`: it
     still counts toward `coverage` (computed separately over every expected
     token), but its absence alone never fails the verdict. Phonetic matches
-    are additionally recorded in `phonetic_matches` (item -> matched ASR
-    word) so a later review can see every such acceptance."""
+    and hyphen matches are additionally recorded (`phonetic_matches`,
+    `hyphen_matches`: item -> matched ASR span) so a later review can see
+    every such acceptance."""
     items = []
     missing = []
     missing_fragile = []
     phonetic_matches = {}
+    hyphen_matches = {}
     for item in mandatory:
         raw_phrase = item if isinstance(item, str) else " ".join(map(str, item))
         phrase = tokenize(raw_phrase)
@@ -678,6 +709,10 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
         label = item if isinstance(item, str) else " ".join(map(str, item))
         items.append(label)
         if _phrase_in(asr, phrase, ratio):
+            continue
+        concat = _concat_match(phrase, asr)
+        if concat:
+            hyphen_matches[label] = concat
             continue
         if is_fragile_mandatory(phrase):
             missing_fragile.append(label)
@@ -690,7 +725,7 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
                 continue
         missing.append(label)
     return {"items": items, "missing": missing, "missing_fragile": missing_fragile,
-            "phonetic_matches": phonetic_matches}
+            "phonetic_matches": phonetic_matches, "hyphen_matches": hyphen_matches}
 
 
 def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
@@ -1411,6 +1446,38 @@ def selfcheck() -> int:
     check("europe swapped for the unrelated erode stays hard-mandatory",
           check_mandatory(tokenize("the attempt to decentre erode entirely"),
                           ["europe"])["missing"] == ["europe"])
+
+    # Hyphen-boundary equivalence: a hyphen changes spelling, never sound, so
+    # a mandatory word split across adjacent ASR tokens (or vice versa) is a
+    # full, exact match -- not a fragile demotion, since there is no
+    # precision trade-off the way there is for phonetic matching.
+    south_hyphen = check_mandatory(tokenize("the centre retreated south eastward to byzantium"),
+                                   ["southeastward"])
+    check("southeastward matches adjacent 'south eastward'",
+          south_hyphen["missing"] == [] and south_hyphen["missing_fragile"] == [] and
+          south_hyphen["hyphen_matches"] == {"southeastward": "south eastward"},
+          repr(south_hyphen))
+    north_hyphen = check_mandatory(tokenize("pressing in from north eastern limits"),
+                                   ["northeastern"])
+    check("northeastern matches adjacent 'north eastern'",
+          north_hyphen["missing"] == [] and
+          north_hyphen["hyphen_matches"] == {"northeastern": "north eastern"},
+          repr(north_hyphen))
+    reverse_hyphen = check_mandatory(tokenize("retreated southeastward to byzantium"),
+                                     ["south-eastward"])
+    check("hyphenated source word matches solid transcript word (reverse direction)",
+          reverse_hyphen["missing"] == [] and
+          reverse_hyphen["hyphen_matches"] == {"south-eastward": "southeastward"},
+          repr(reverse_hyphen))
+    check("non-adjacent tokens do not concatenate-match",
+          check_mandatory(tokenize("south of the region moved eastward"),
+                          ["southeastward"])["missing"] == ["southeastward"])
+    check("partial concatenation does not match",
+          check_mandatory(tokenize("moved south east"),
+                          ["southeastward"])["missing"] == ["southeastward"])
+    check("unrelated words stay hard failures under concatenation matching",
+          check_mandatory(tokenize("a conscious attempt to demolish europe"),
+                          ["southeastward"])["missing"] == ["southeastward"])
 
     check("terminal suffix present",
           terminal_suffix(tokenize("the history attempts to explain"),
