@@ -82,6 +82,7 @@ class Config:
     model_revision: str
     language: str
     max_tokens: int
+    seed: int
     asr_repo: str
     asr_revision: str
 
@@ -122,6 +123,7 @@ def load_config(root) -> Config:
         model_revision=_name(model, "model", "revision"),
         language=_name(model, "model", "language"),
         max_tokens=_int(model, "model", "max_tokens"),
+        seed=_int(model, "model", "seed"),
         asr_repo=_name(asr_, "asr", "repo"),
         asr_revision=_name(asr_, "asr", "revision"),
     )

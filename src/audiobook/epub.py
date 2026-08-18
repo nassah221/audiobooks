@@ -6,8 +6,8 @@ calibre splits of the same chapter), and excludes notes, further reading,
 index, and all other front matter. Footnote links and sup markers are
 stripped without touching prose digits, page-number cross references are
 removed, continuation files that calibre split mid-paragraph are merged
-back, typography and numbers are normalized with the explicit rules below,
-and text is split into sentences conservatively.
+back, and typography and numbers are normalized with the explicit rules
+below. Paragraph boundaries from the EPUB are preserved for generation.
 
 Normalization rules (explicit, frozen):
   N1  Double quotation marks (U+201C/U+201D, ASCII ") are removed.
@@ -29,17 +29,12 @@ Normalization rules (explicit, frozen):
       - decimals "1.3" read "one point three";
       - other integers read as ordinary words ("600,000" -> "six hundred
         thousand", British "and").
-
-Sentence splitting is conservative: split only after . ! ? followed by
-whitespace and an uppercase letter, digit, quote, or end of text; never
-after known abbreviations ("Mr.", "e.g.", "p.m."), a single capital
-initial ("G. D. H. Cole"), or a decimal point. Ellipses and semicolons
-never split.
 """
+import hashlib
 import argparse
-import pathlib
 import posixpath
 import re
+import pathlib
 import sys
 import zipfile
 from html.parser import HTMLParser
@@ -50,9 +45,15 @@ __all__ = [
     "read_spine",
     "extract_chapters",
     "chapter_paragraphs",
-    "split_sentences",
     "expand_numbers",
+    "split_sentences",
+    "sentence_spans",
+    "clause_boundaries",
+    "clause_spans",
+    "group_sentences",
+    "sentence_chunks",
 ]
+
 
 # href basename -> canonical chapter id (spine order: preface, names, ch01..ch09)
 SELECTION = {
@@ -62,6 +63,9 @@ SELECTION = {
 
 CHAPTER_RE = re.compile(r"ch(\d{2})([a-z]*)\.html")
 
+SENTENCE_GROUP_POLICY = "paragraph-sentences-clauses"
+SENTENCE_GROUP_VERSION = 2
+SENTENCE_GROUP_LIMITS = {"target_words": 70, "max_words": 85}
 BLOCK_TAGS = {"p", "div", "li", "td", "th", "blockquote", "dd", "dt"}
 SKIP_TAGS = {"script", "style", "sup"}  # sup: footnote markers only (verified all-numeric)
 HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
@@ -69,6 +73,9 @@ VOID_TAGS = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
      "param", "source", "track", "wbr"}
 )
+
+
+
 
 # ---------------------------------------------------------------------------
 # Spine
@@ -410,15 +417,13 @@ def expand_numbers(text: str) -> str:
     out.append(text[pos:])
     return "".join(out)
 
-
 def normalize_typography(text: str) -> str:
     """Rules N1-N4."""
-    text = re.sub(r"\s+", " ", text).strip()  # N4
-    text = re.sub(r"\s+[–—-]{1,2}\s+", ", ", text)  # N3 (spaced en/em/hyphen dash, " - " or " -- ")
-    text = re.sub(r"[\u201c\u201d\"]", "", text)  # N1 (double quotes)
-    text = re.sub(r"[\u2018\u2019']", lambda m: "'" if _between_words(text, m.start()) else "", text)  # N2
     text = re.sub(r"\s+", " ", text).strip()
-    return text
+    text = re.sub(r"\s+[–—-]{1,2}\s+", ", ", text)
+    text = re.sub(r"[\u201c\u201d\"]", "", text)
+    text = re.sub(r"[\u2018\u2019']", lambda m: "'" if _between_words(text, m.start()) else "", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _between_words(text: str, i: int) -> bool:
@@ -429,84 +434,181 @@ def normalize_paragraph(text: str) -> str:
     return expand_numbers(normalize_typography(text))
 
 
-# ---------------------------------------------------------------------------
-# Sentence splitting (conservative)
+_ABBREVIATIONS = {
+    "a.m.", "cf.", "dr.", "e.g.", "etc.", "fig.", "i.e.", "mr.",
+    "mrs.", "ms.", "no.", "nos.", "p.", "p.m.", "pp.", "prof.",
+    "st.", "vol.", "vs.",
+}
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w']+\b", text))
 
 
-ABBREVIATIONS = frozenset(
-    """mr mrs ms dr st sr jr rev hon prof capt col gen lt sgt adm
-    vs etc e.g i.e viz cf approx dept est fig figs ch chap no nos pp p
-    ed eds trans vol vols sec min hr a.m p.m ltd co inc jan feb mar apr
-    jun jul aug sep sept oct nov dec sun mon tue wed thu fri sat
-    """.split()
-)
+def clause_boundaries(text: str, sentence_start: int = 0) -> list[dict]:
+    """Return eligible punctuation cuts in one exact sentence slice.
+
+    Offsets are relative to ``text`` and ``source_offset`` carries the
+    corresponding offset when callers pass a larger source string.
+    """
+    candidates = []
+    for match in re.finditer(r"[:;—]|\),", text):
+        cut = match.end()
+        left_words = _word_count(text[:cut])
+        right_words = _word_count(text[cut:])
+        if left_words < 8 or right_words < 8:
+            continue
+        punctuation = match.group()
+        candidates.append({
+            "offset": cut,
+            "source_offset": sentence_start + cut,
+            "punctuation": punctuation,
+            "kind": "parenthetical-comma" if punctuation == ")," else punctuation,
+            "left_words": left_words,
+            "right_words": right_words,
+        })
+    return candidates
 
 
-def _word_before(text: str, i: int) -> str:
-    """Letters/digits/dots immediately before position i (the token ending at i)."""
-    j = i
-    while j > 0 and (text[j - 1].isalnum() or text[j - 1] in ".-"):
-        j -= 1
-    return text[j:i]
-
-
-def split_sentences(text: str) -> list:
-    """Split on . ! ? conservatively; see module docstring."""
-    out = []
+def clause_spans(text: str, sentence_start: int = 0) -> list[dict]:
+    """Split one sentence at eligible boundaries, preserving exact slices."""
+    boundaries = clause_boundaries(text, sentence_start)
+    spans = []
     start = 0
-    i = 0
-    n = len(text)
-    while i < n:
-        c = text[i]
-        if c in ".!?":
-            if c == ".":
-                token = _word_before(text, i).lower()
-                if token in ABBREVIATIONS:
-                    i += 1
-                    continue
-                if re.fullmatch(r"[A-Z]\.", text[_word_start(text, i):i + 1]):
-                    i += 1
-                    continue
-                if i > 0 and text[i - 1].isdigit() and i + 1 < n and text[i + 1].isdigit():
-                    i += 1
-                    continue
-            j = i + 1
-            while j < n and text[j] in "'\"\u2019\u201d)]":
-                j += 1
-            if j < n and text[j].isspace():
-                j2 = j
-                while j2 < n and text[j2].isspace():
-                    j2 += 1
-                if j2 >= n or text[j2].isupper() or text[j2].isdigit() or text[j2] in "'\"\u2018\u201c":
-                    out.append(text[start:j2].strip())
-                    start = j2
-                    i = j2
-                    continue
-        i += 1
-    tail = text[start:].strip()
-    if tail:
-        out.append(tail)
-    return out
+    for index, boundary in enumerate(boundaries):
+        cut = boundary["offset"]
+        # Keep inter-clause whitespace in the preceding slice so slices are
+        # contiguous and can reconstruct the original source with join("").
+        end = cut
+        while end < len(text) and text[end].isspace():
+            end += 1
+        spans.append({
+            "start": sentence_start + start,
+            "end": sentence_start + end,
+            "text": text[start:end],
+            "words": _word_count(text[start:end]),
+            "sentence_start": sentence_start,
+            "clause_index": index,
+            "boundary_after": dict(boundary),
+        })
+        start = end
+    spans.append({
+        "start": sentence_start + start,
+        "end": sentence_start + len(text),
+        "text": text[start:],
+        "words": _word_count(text[start:]),
+        "sentence_start": sentence_start,
+        "clause_index": len(boundaries),
+        "boundary_after": None,
+    })
+    return spans
 
 
-def _word_start(text: str, i: int) -> int:
-    j = i
-    while j > 0 and (text[j - 1].isalnum() or text[j - 1] in ".-"):
-        j -= 1
-    return j
+def sentence_spans(text: str) -> list[dict]:
+    """Return conservative, exact sentence slices of normalized prose."""
+    spans = []
+    start = 0
+    for match in re.finditer(r"[.!?]+[)\]]?(?=\s|$)", text):
+        end = match.end()
+        token = text[start:match.start() + 1].rsplit(" ", 1)[-1]
+        if (match.group()[0] == "." and
+                (token.lower() in _ABBREVIATIONS or
+                 re.fullmatch(r"(?:[A-Z]\.)+", token))):
+            continue
+        next_char = text[end:].lstrip()[:1]
+        if next_char and next_char.islower():
+            continue
+        while start < end and text[start].isspace():
+            start += 1
+        sentence = text[start:end]
+        spans.append({"start": start, "end": end, "text": sentence,
+                      "words": _word_count(sentence),
+                      "clause_boundaries": clause_boundaries(sentence, start),
+                      "clause_spans": clause_spans(sentence, start)})
+        start = end
+    while start < len(text) and text[start].isspace():
+        start += 1
+    if start < len(text):
+        sentence = text[start:]
+        spans.append({"start": start, "end": len(text), "text": sentence,
+                      "words": _word_count(sentence),
+                      "clause_boundaries": clause_boundaries(sentence, start),
+                      "clause_spans": clause_spans(sentence, start)})
+    return spans or ([{"start": 0, "end": len(text), "text": text,
+                       "words": _word_count(text),
+                       "clause_boundaries": clause_boundaries(text),
+                       "clause_spans": clause_spans(text)}] if text else [])
+
+
+def split_sentences(text: str) -> list[str]:
+    return [span["text"] for span in sentence_spans(text)]
+
+
+def group_sentences(text: str, spans=None, target_words: int = 70,
+                    max_words: int = 85) -> list[dict]:
+    """Pack sentence and eligible clause slices toward target, under max."""
+    spans = sentence_spans(text) if spans is None else spans
+    units = []
+    for sentence_index, sentence in enumerate(spans):
+        for clause_index, clause in enumerate(sentence.get("clause_spans") or [sentence]):
+            unit = dict(clause)
+            unit["sentence_index"] = sentence_index
+            unit["clause_index"] = clause_index
+            units.append(unit)
+    groups = []
+    start = 0
+    while start < len(units):
+        end = start
+        words = 0
+        while end < len(units):
+            unit_words = units[end]["words"]
+            if end > start and (words >= target_words or words + unit_words > max_words):
+                break
+            words += unit_words
+            end += 1
+        selected = units[start:end]
+        a, b = selected[0]["start"], selected[-1]["end"]
+        sentence_indexes = sorted({u["sentence_index"] for u in selected})
+        clause_indexes = [[u["sentence_index"], u["clause_index"]] for u in selected]
+        chunk_text = text[a:b]
+        groups.append({
+            "text": chunk_text,
+            "text_sha256": hashlib.sha256(chunk_text.encode()).hexdigest(),
+            "start": a,
+            "end": b,
+            "sentence_span": [sentence_indexes[0], sentence_indexes[-1] + 1],
+            "sentence_indexes": sentence_indexes,
+            "sentence_count": len(sentence_indexes),
+            "clause_indexes": clause_indexes,
+            "clause_count": len(selected),
+            "clause_spans": selected,
+            "words": words,
+        })
+        start = end
+    return groups
+
+
+def sentence_chunks(text: str, max_words: int = 85) -> list[dict]:
+    groups = group_sentences(text, max_words=max_words)
+    return [{"text": g["text"], "sentence_start": g["sentence_span"][0],
+             "sentence_end": g["sentence_span"][1],
+             "sentence_count": g["sentence_count"], "words": g["words"],
+             "clause_indexes": g["clause_indexes"],
+             "clause_count": g["clause_count"],
+             "clause_spans": g["clause_spans"]}
+            for g in groups]
+
 
 
 def extract_chapters(epub_path):
-    """[{'id', 'title', 'sentences': [...]}] in spine order for selected chapters."""
+    """[{'id', 'title', 'paragraphs': [...]}] in spine order."""
     paras_by_chapter = chapter_paragraphs(epub_path)
     titles = paras_by_chapter.attrs["titles"]  # type: ignore[attr-defined]
     chapters = []
     for chapter_id, paras in paras_by_chapter.items():
-        sentences = []
-        for p in paras:
-            sentences.extend(split_sentences(normalize_paragraph(p)))
+        paragraphs = [text for p in paras if (text := normalize_paragraph(p))]
         chapters.append(
-            {"id": chapter_id, "title": titles.get(chapter_id, chapter_id), "sentences": sentences}
+            {"id": chapter_id, "title": titles.get(chapter_id, chapter_id),
+             "paragraphs": paragraphs}
         )
     return chapters
 
@@ -532,9 +634,9 @@ def _frozen_book_checks(chapters):
     check("title is heading text only (ch09)", by_id["ch09"]["title"] == "9 Tamerlane’s Shadow")
     # ch02's first prose paragraph sits right after the <h2> + <img/>; it used
     # to be swallowed into the title when the heading stayed open.
-    ch02_text = " ".join(by_id["ch02"]["sentences"])
+    ch02_text = " ".join(by_id["ch02"]["paragraphs"])
     check("ch02 opening prose retained", "In retrospect, we can see" in ch02_text)
-    pref_text = " ".join(by_id["preface"]["sentences"])
+    pref_text = " ".join(by_id["preface"]["paragraphs"])
     check("preface opening prose retained", bool(pref_text.strip()))
     return ok
 
@@ -544,8 +646,10 @@ def _frozen_book_checks(chapters):
 
 
 def selfcheck() -> int:
-    """Unit-level checks of selection, normalization, and splitting rules.
-    Pure stdlib; never touches the book or any model."""
+    """Unit-level checks of selection and normalization rules.
+
+    Pure stdlib; never touches the book or any model.
+    """
     results = []
 
     def check(name, cond, detail=""):
@@ -578,14 +682,18 @@ def selfcheck() -> int:
     check("N5 decimal", expand_numbers("1.3") == "one point three")
     check("N5 large integer", expand_numbers("600,000") == "six hundred thousand")
     check("int_to_words 1001", int_to_words(1001) == "one thousand and one")
+    check("sentence split preserves abbreviations",
+          split_sentences("Dr. Smith left. He returned at 3.5 p.m. quietly.") ==
+          ["Dr. Smith left.", "He returned at 3.5 p.m. quietly."])
+    grouped = sentence_chunks("One two. Three four five. Six seven.", max_words=5)
+    check("sentence chunks bounded and exact",
+          [c["text"] for c in grouped] == ["One two. Three four five.", "Six seven."]
+          and " ".join(c["text"] for c in grouped) ==
+          "One two. Three four five. Six seven.")
+    oversized = sentence_chunks("One two three four five six.", max_words=3)
+    check("oversized sentence stays intact", len(oversized) == 1
+          and oversized[0]["words"] == 6)
 
-    check("split keeps abbreviations", split_sentences("Mr. Smith left. He went home.") ==
-          ["Mr. Smith left.", "He went home."])
-    check("split keeps single initials", split_sentences("G. D. H. Cole wrote.") == ["G. D. H. Cole wrote."])
-    check("split keeps decimals", split_sentences("It rose 1.3 points.") == ["It rose 1.3 points."])
-    check("split never on ellipsis", split_sentences("Wait... really?") == ["Wait... really?"])
-    check("split never on semicolon", split_sentences("a; b.") == ["a; b."])
-    check("split keeps e.g.", split_sentences("e.g. this is fine.") == ["e.g. this is fine."])
 
     check("merge continuation", _continues("he said", "quietly") is True
           and _continues("He stopped.", "Then he ran") is False)
@@ -598,12 +706,23 @@ def selfcheck() -> int:
     _br.close()
     check("heading intact across <br/>",
           _br._first_heading == "Title Line two" and _br._paras == ["Opening prose."])
+    long_tail = "one two three four five six seven eight"
+    for mark, label in ((":", "colon"), (";", "semicolon"), ("—", "em dash")):
+        sample = long_tail + mark + " " + long_tail + "."
+        boundaries = clause_boundaries(sample)
+        check(label + " clause split", len(boundaries) == 1 and boundaries[0]["punctuation"] == mark)
+        check(label + " exact reconstruction", "".join(s["text"] for s in clause_spans(sample)) == sample)
+    paren = long_tail + " (nine ten eleven twelve thirteen fourteen fifteen sixteen), " + long_tail + "."
+    check("parenthetical comma split", any(b["kind"] == "parenthetical-comma" for b in clause_boundaries(paren)))
+    short = "one two three : four five six seven eight nine ten eleven twelve."
+    check("clause rejects short side", clause_boundaries(short) == [])
+    comma = long_tail + ", " + long_tail + "."
+    check("ordinary comma ignored", clause_boundaries(comma) == [])
     _bra = _TextExtractor()
     _bra.feed("<h2>A<br/>B</h2><p class=\"image\"><img src=\"x\"/></p><p>Body one.</p>")
     _bra.close()
     check("self-closing img doesn't drop paragraph",
           _bra._first_heading == "A B" and _bra._paras == ["Body one."])
-
     failed = [name for name, ok in results if not ok]
     print(f"selfcheck: {len(results) - len(failed)}/{len(results)} passed")
     return 1 if failed else 0
@@ -624,7 +743,7 @@ def main(argv=None) -> int:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selfcheck", help="run the normalization/splitting unit self-check")
-    p = sub.add_parser("extract", help="dry-run extraction: print chapter/sentence counts")
+    p = sub.add_parser("extract", help="dry-run extraction: print chapter/paragraph counts")
     p.add_argument("--book", help="EPUB path (default: <repo>/books/after-tamerlane.epub)")
     args = ap.parse_args(argv)
 
@@ -637,9 +756,9 @@ def main(argv=None) -> int:
         print(f"extract: {e}", file=sys.stderr)
         return 1
     for c in chapters:
-        print(f"  {c['id']:<8} {len(c['sentences']):>5} sentences  {c['title'][:60]}")
-    total = sum(len(c["sentences"]) for c in chapters)
-    print(f"chapters={len(chapters)} sentences={total}")
+        print(f"  {c['id']:<8} {len(c['paragraphs']):>5} paragraphs  {c['title'][:60]}")
+    total = sum(len(c["paragraphs"]) for c in chapters)
+    print(f"chapters={len(chapters)} paragraphs={total}")
     if not _frozen_book_checks(chapters):
         return 1
     return 0

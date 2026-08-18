@@ -14,7 +14,7 @@ import sys
 from . import runner
 from .runner import RunError
 
-_HELP = "Frozen Qwen3-TTS + Bragg-reference audiobook generation (Apple Silicon MLX)."
+_HELP = "Frozen Qwen3-TTS + Bragg-reference audiobook generation (Apple Silicon MLX), using paragraph-bounded sentence chunks."
 
 
 def _add_common(ap: argparse.ArgumentParser):
@@ -35,16 +35,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("preflight", help="inputs + hashes, model cache, env, extraction, measured pilot")
     p.add_argument("--sentence", default=runner.PILOT_SENTENCE,
-                   help="benchmark sentence (default: the frozen pilot sentence)")
+                   help="measured preflight pilot text (default: the frozen pilot sentence)")
     p.add_argument("--no-benchmark", action="store_true",
                    help="checks + extraction only; no model load")
     p.add_argument("--offline", action="store_true", help="forbid downloads (fail if cache incomplete)")
     p.add_argument("--validate/--no-validate", dest="validate", action=argparse.BooleanOptionalAction,
-                   default=True, help="ASR-validate the benchmark chunk (default: on)")
+                   default=True, help="ASR-validate the measured pilot (default: on)")
 
-    p = sub.add_parser("generate", help="resumable full-book generation (PCM16 checkpoints)")
+    p = sub.add_parser("generate", help="resumable generation (sentence-bounded PCM16 checkpoints)")
     p.add_argument("--chapters", help="comma list with ranges, e.g. 1-9,preface,names (default: all)")
-    p.add_argument("--limit", type=int, help="max sentences (smoke runs)")
+    p.add_argument("--limit", type=int, help="max sentence chunks (smoke runs)")
     p.add_argument("--offline", action="store_true", help="forbid downloads (fail if cache incomplete)")
     p.add_argument("--force", action="store_true", help="ignore resume; regenerate everything")
     p.add_argument("--resume-from", help="skip chapters before this one (e.g. ch03)")
@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chapters", help="comma list with ranges, e.g. 1-9,preface,names (default: all)")
     p.add_argument("--limit", type=int, help="max chunks to validate")
 
-    sub.add_parser("eta", help="projected generation + ASR cost from the measured benchmark")
+    sub.add_parser("eta", help="projected generation + ASR cost from the measured preflight pilot")
 
     return ap
 
@@ -72,21 +72,21 @@ def _print_preflight(rpt: dict) -> None:
     print("  packages: " + ", ".join(f"{n} {v}" for n, v in pkgs.items() if v) +
           (f"  [missing: {', '.join(missing_pkgs)}]" if missing_pkgs else ""))
     ex = rpt["extraction"]
-    counts = ", ".join(f"{c['id']}={c['sentences']}" for c in ex["chapters"])
-    print(f"  extraction: {len(ex['chapters'])} chapters, {ex['total_sentences']} sentences ({counts})")
-    bm = rpt["benchmark"]
-    if bm is None:
-        print("  benchmark: skipped (--no-benchmark)")
+    counts = ", ".join(f"{c['id']}={c['paragraphs']}" for c in ex["chapters"])
+    print(f"  extraction: {len(ex['chapters'])} chapters, {ex['total_paragraphs']} paragraphs ({counts})")
+    pilot = rpt["benchmark"]
+    if pilot is None:
+        print("  measured pilot: skipped (--no-benchmark)")
         return
-    m = bm["metrics"]
+    m = pilot["metrics"]
     asr_line = ""
-    if bm["asr"]:
-        a = bm["asr"]
+    if pilot["asr"]:
+        a = pilot["asr"]
         asr_line = f" asr rtf {a['rtf']} ({a['verdict']})" if a["rtf"] else f" asr {a['verdict']}"
-    print(f"  benchmark: {bm['verdict']} gen {m['generation_seconds']}s "
-          f"load {bm['load_seconds']}s audio {m.get('audio_seconds')}s{asr_line}")
-    if bm["verdict"] != "PASS":
-        for e in bm.get("errors", []):
+    print(f"  measured pilot: {pilot['verdict']} gen {m['generation_seconds']}s "
+          f"load {pilot['load_seconds']}s audio {m.get('audio_seconds')}s{asr_line}")
+    if pilot["verdict"] != "PASS":
+        for e in pilot.get("errors", []):
             print(f"    - {e}")
 
 
@@ -105,7 +105,7 @@ def _print_validate(rpt: dict) -> None:
 
 def _print_eta(rpt: dict) -> None:
     print("audiobook eta")
-    print(f"  plan: {rpt['chapters']} chapters, {rpt['sentences']} sentences, {rpt['words']} words")
+    print(f"  plan: {rpt['chapters']} chapters, {rpt['paragraphs']} paragraphs, {rpt['words']} words")
     print(f"  estimated audio: {rpt['estimated_audio_seconds'] / 60:.1f} min")
     print(f"  generation:     {rpt['generation_seconds'] / 60:.1f} min "
           f"(model load {rpt['model_load_seconds']}s once)")
@@ -135,7 +135,7 @@ def main(argv=None) -> int:
                 offline=True if args.offline else None,
             ).run()
             print(f"generated {summary['generated']} chunk(s); {summary['done_total']}/"
-                  f"{summary['plan']['sentences']} done "
+                  f"{summary['plan']['groups']} done "
                   f"(gen {summary['generation_seconds']}s, audio {summary['audio_seconds']}s)")
         elif args.cmd == "validate":
             _print_validate(runner.validate_generated(

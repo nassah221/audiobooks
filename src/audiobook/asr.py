@@ -29,12 +29,15 @@ Record schema (all values JSON-native):
     confidence: {avg_logprob, no_speech_prob, compression_ratio},
     coverage: {expected_tokens, matched_tokens, fraction, missing},
     mandatory: {items, missing},
-    repetition: {max_multiplicity, most_repeated, repeated_count},
+    terminal: {expected, matched},
+    repetition: {max_multiplicity, most_repeated, repeated_count}
     leakage: {flagged, detail},
     words: {count, first_start, last_end, max_internal_gap_s, long_gaps_over_1s},
+    word_timings: [{text, start, end}],
+    punctuation: {boundaries, sentence_end, colon_semicolon,
+                  parenthetical_comma, comma},
     signal: {seconds, sample_rate, channels, subtype, rms, peak, active_ratio, sha256},
     verdict, reasons, asr_seconds, rtf, cache_hit
-
 Module import is stdlib-only; numpy/soundfile load lazily on first audio
 read, mlx_whisper lazily on first transcribe (actionable error otherwise).
 """
@@ -60,6 +63,7 @@ from collections import Counter
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
+VALIDATION_POLICY = "paragraph-v7-century-equivalence"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -80,6 +84,80 @@ _NUM_WORDS = {
     "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70",
     "eighty": "80", "ninety": "90",
 }
+_ORDINAL_WORDS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+    "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14,
+    "fifteenth": 15, "sixteenth": 16, "seventeenth": 17,
+    "eighteenth": 18, "nineteenth": 19, "twentieth": 20,
+    "thirtieth": 30,
+}
+_ORDINAL_UNITS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9,
+}
+for _tens, _base in (("twenty", 20), ("thirty", 30)):
+    for _word, _unit in _ORDINAL_UNITS.items():
+        if _base + _unit <= 31:
+            _ORDINAL_WORDS[f"{_tens}-{_word}"] = _base + _unit
+            _ORDINAL_WORDS[f"{_tens} {_word}"] = _base + _unit
+_ORDINAL_WORD_RE = re.compile(
+    r"(?<![a-z0-9])(" + "|".join(
+        sorted(_ORDINAL_WORDS, key=len, reverse=True)
+    ) + r")(?![a-z0-9])"
+)
+_NUMERIC_RANGE_RE = re.compile(r"(?<![a-z0-9])(\d+)-(\d+)(?![a-z0-9])")
+_DECIMAL_RE = re.compile(r"(?<![a-z0-9])(\d+)\.(\d+)(?![a-z0-9])")
+_NUMERIC_ORDINAL_RE = re.compile(r"(?<![a-z0-9])(\d+)(?:st|nd|rd|th)(?![a-z0-9])")
+_DECADE_SUFFIXES = {
+    "twenties": "20", "thirties": "30", "forties": "40", "fifties": "50",
+    "sixties": "60", "seventies": "70", "eighties": "80", "nineties": "90",
+    "20": "20", "30": "30", "40": "40", "50": "50", "60": "60",
+    "70": "70", "80": "80", "90": "90",
+}
+_DECADE_PREFIXES = {str(n): str(n) for n in range(10, 20)}
+_CENTURY_PREFIXES = {str(n): str(n * 100) for n in range(10, 20)}
+
+
+def _merge_century_tokens(tokens: list) -> list:
+    """Canonicalize spoken ``fourteen hundred`` and written ``1400``."""
+    merged = []
+    i = 0
+    while i < len(tokens):
+        if (i + 1 < len(tokens) and str(tokens[i]) in _CENTURY_PREFIXES
+                and str(tokens[i + 1]) == "hundred"
+                and (i + 2 == len(tokens) or not str(tokens[i + 2]).isdigit())):
+            merged.append(_CENTURY_PREFIXES[str(tokens[i])])
+            i += 2
+            continue
+        merged.append(tokens[i])
+        i += 1
+    return merged
+
+_DECADE_NUMERIC_RE = re.compile(r"^(1[0-9])(\d0)(?:'s|s)$")
+
+def _merge_decade_tokens(tokens: list) -> list:
+    """Canonicalize spoken ``thirteen thirties`` and written ``1330s``."""
+    merged = []
+    i = 0
+    while i < len(tokens):
+        token = str(tokens[i])
+        numeric = _DECADE_NUMERIC_RE.fullmatch(token)
+        if numeric:
+            merged.append(f"{numeric.group(1)}{numeric.group(2)}s")
+            i += 1
+            continue
+        if i + 1 < len(tokens):
+            prefix, suffix = token, str(tokens[i + 1])
+            suffix = suffix.removesuffix("'s")
+            if prefix in _DECADE_PREFIXES and suffix in _DECADE_SUFFIXES:
+                merged.append(f"{prefix}{_DECADE_SUFFIXES[suffix]}s")
+                i += 2
+                continue
+        merged.append(tokens[i])
+        i += 1
+    return merged
+
 _TENS_COMPOUND_RE = re.compile(
     r"\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)-"
     r"(one|two|three|four|five|six|seven|eight|nine)\b"
@@ -114,18 +192,20 @@ def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-# --- normalization -----------------------------------------------------------
 def tokenize(text: str) -> list:
-    """Normalize spoken text into comparable tokens.
-
-    Lowercases, drops punctuation, folds numbers so both sides agree:
-    number words -> digits, "fourteen oh five" -> "1405" (digit runs merge),
-    hyphenated compounds ("twenty-one") -> "21". Apostrophes are kept so
-    possessives/contractions survive. Both expected text and transcript go
-    through the same transform, so any heuristic applies symmetrically.
-    """
+    """Normalize spoken and written text into comparable tokens."""
     t = text.lower().replace("\u2019", "'")
-    # hyphenated number compounds first (before punctuation stripping)
+    t = _DECIMAL_RE.sub(r"\1 point \2", t)
+    t = _NUMERIC_RANGE_RE.sub(r"\1 to \2", t)
+    t = _DECADE_NUMERIC_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}s", t)
+
+    def ordinal(m):
+        n = _ORDINAL_WORDS[m.group(1)]
+        suffix = "th" if n % 10 not in (1, 2, 3) or n % 100 in (11, 12, 13) else {1: "st", 2: "nd", 3: "rd"}[n % 10]
+        return f"{n}{suffix}"
+
+    t = _ORDINAL_WORD_RE.sub(ordinal, t)
+    t = _NUMERIC_ORDINAL_RE.sub(lambda m: m.group(1) + m.group(0)[-2:], t)
     t = _TENS_COMPOUND_RE.sub(
         lambda m: str(int(_NUM_WORDS[m.group(1)]) + int(_NUM_WORDS[m.group(2)])), t
     )
@@ -135,8 +215,6 @@ def tokenize(text: str) -> list:
         if tok in _NUM_WORDS:
             out.append(_NUM_WORDS[tok])
         elif tok == "oh":
-            # spoken digit "oh" ("fourteen oh five"); harmless elsewhere since
-            # both sides normalize identically
             out.append("0")
         else:
             out.append(tok)
@@ -152,13 +230,138 @@ def tokenize(text: str) -> list:
             merged.append(tok)
     if run:
         merged.append("".join(run))
-    # ponytail: digit-run merge ("14 0 5" -> "1405") can misfire on unrelated
-    # adjacent number words ("nineteen eighty seven" -> "19807"); acceptable
-    # for this corpus (sentences are known), revisit with a word-phrase map if
-    # years-within-prose ever gate wrongly.
-    return merged
+    return _merge_century_tokens(_merge_decade_tokens(merged))
 
 
+
+
+PUNCTUATION_THRESHOLDS = {
+    "sentence_end": 0.150,
+    "colon_semicolon": 0.100,
+    "parenthetical_comma": 0.075,
+    "comma": None,
+}
+
+
+def normalized_word_timings(segments: list) -> list:
+    """Return JSON-native normalized tokens with their Whisper timings."""
+    out = []
+    for segment in segments or []:
+        for word in segment.get("words") or []:
+            if "start" not in word or "end" not in word:
+                continue
+            start, end = float(word["start"]), float(word["end"])
+            tokens = tokenize(str(word.get("word", word.get("text", ""))))
+            for text in tokens:
+                if text.isdigit() and out and out[-1]["text"].isdigit():
+                    out[-1]["text"] += text
+                    out[-1]["end"] = end
+                else:
+                    out.append({"text": text, "start": start, "end": end})
+    return out
+
+
+def _source_punctuation_boundaries(source: str) -> list:
+    """Find punctuation boundaries and their preceding normalized token."""
+    boundaries = []
+    for chunk_match in re.finditer(r"\S+", source):
+        chunk = chunk_match.group(0)
+        chunk_tokens = tokenize(chunk)
+        if not chunk_tokens:
+            continue
+        for punctuation in re.finditer(r"[.?!:;,]+", chunk):
+            mark = punctuation.group(0)
+            before = chunk[:punctuation.start()]
+            preceding = tokenize(source[:chunk_match.start()] + before)
+            if not preceding:
+                continue
+            if mark[0] == ".":
+                pos = punctuation.start()
+                if pos and pos + 1 < len(chunk) and chunk[pos - 1].isdigit() and chunk[pos + 1].isdigit():
+                    continue
+                kind = "sentence_end"
+            elif mark[0] in ":;":
+                kind = "colon_semicolon"
+            elif mark[0] == "," and before.endswith(")"):
+                kind = "parenthetical_comma"
+            elif mark[0] == ",":
+                kind = "comma"
+            else:
+                continue
+            boundaries.append({
+                "kind": kind,
+                "punctuation": mark[0],
+                "expected_token_index": len(preceding) - 1,
+            })
+    return boundaries
+
+
+def _fuzzy_alignment(expected: list, asr: list, ratio: float = MANDATORY_FUZZY_RATIO) -> dict:
+    """Map expected tokens to ASR positions with ordered fuzzy LCS."""
+    n, m = len(expected), len(asr)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            dp[i][j] = (dp[i + 1][j + 1] + 1 if _tok_eq(expected[i], asr[j], ratio)
+                        else max(dp[i + 1][j], dp[i][j + 1]))
+    mapping = {}
+    i = j = 0
+    while i < n and j < m:
+        if _tok_eq(expected[i], asr[j], ratio) and dp[i][j] == dp[i + 1][j + 1] + 1:
+            mapping[i] = j
+            i += 1
+            j += 1
+        elif dp[i + 1][j] >= dp[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return mapping
+
+
+def punctuation_metrics(source: str, word_timings: list) -> dict:
+    """Measure source punctuation pauses against ordered ASR word timings."""
+    expected = tokenize(source)
+    asr = [str(word["text"]) for word in word_timings or []]
+    mapping = _fuzzy_alignment(expected, asr)
+    boundaries = []
+    groups = {kind: [] for kind in PUNCTUATION_THRESHOLDS}
+    for boundary in _source_punctuation_boundaries(source):
+        kind = boundary["kind"]
+        idx = boundary["expected_token_index"]
+        before_asr = mapping.get(idx)
+        after_asr = mapping.get(idx + 1)
+        aligned = before_asr is not None and after_asr is not None
+        gap = None
+        if aligned:
+            gap = round(float(word_timings[after_asr]["start"]) - float(word_timings[before_asr]["end"]), 4)
+        threshold = PUNCTUATION_THRESHOLDS[kind]
+        passed = None if not aligned or threshold is None else gap >= threshold
+        measured = {
+            **boundary,
+            "asr_token_index": before_asr,
+            "next_asr_token_index": after_asr,
+            "aligned": aligned,
+            "gap_s": gap,
+            "threshold_s": threshold,
+            "passed": passed,
+        }
+        boundaries.append(measured)
+        groups[kind].append(measured)
+
+    def summary(items):
+        return {
+            "checked": len(items),
+            "aligned": sum(1 for item in items if item["aligned"]),
+            "passed": sum(1 for item in items if item["passed"] is True),
+            "failed": sum(1 for item in items if item["passed"] is False),
+            "unaligned": sum(1 for item in items if not item["aligned"]),
+            "gaps_s": [item["gap_s"] for item in items if item["gap_s"] is not None],
+        }
+
+    return {
+        "boundaries": boundaries,
+        **{kind: summary(items) for kind, items in groups.items()},
+    }
 def normalize(text: str) -> str:
     return " ".join(tokenize(text))
 
@@ -227,14 +430,25 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
     items = []
     missing = []
     for item in mandatory:
-        phrase = tokenize(item) if isinstance(item, str) else list(item)
+        raw_phrase = item if isinstance(item, str) else " ".join(map(str, item))
+        phrase = tokenize(raw_phrase)
         if not phrase:
             continue
-        label = item if isinstance(item, str) else " ".join(item)
+        label = item if isinstance(item, str) else " ".join(map(str, item))
         items.append(label)
         if not _phrase_in(asr, phrase, ratio):
             missing.append(label)
     return {"items": items, "missing": missing}
+
+
+def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
+    """Require the final expected phrase near the end of the transcript."""
+    tail = expected[-size:]
+    window = asr[-(len(tail) + 2):]
+    return {
+        "expected": " ".join(tail),
+        "matched": not tail or _phrase_in(window, tail, MANDATORY_FUZZY_RATIO),
+    }
 
 
 def derive_mandatory(expected_tokens: list) -> list:
@@ -253,20 +467,24 @@ def derive_mandatory(expected_tokens: list) -> list:
     return out
 
 
-def repetition_stats(tokens: list) -> dict:
-    """Repeated adjacent n-grams (n=2..4) — whisper loop/hallucination signal."""
+def repetition_stats(tokens: list, expected=()) -> dict:
+    """Report transcript multiplicity for n-grams beyond expected counts."""
     counts = Counter()
+    expected_counts = Counter()
     for n in (2, 3, 4):
         for i in range(len(tokens) - n + 1):
             counts[tuple(tokens[i:i + n])] += 1
-    reps = {k: v for k, v in counts.items() if v > 1}
-    if not reps:
-        return {"max_multiplicity": 1, "most_repeated": None, "repeated_count": 0}
-    best = max(reps, key=reps.get)
+        for i in range(len(expected) - n + 1):
+            expected_counts[tuple(expected[i:i + n])] += 1
+    repeated = {k: v for k, v in counts.items()
+                if v > 1 and v > expected_counts[k]}
+    if not repeated:
+        return {"max_multiplicity": 0, "most_repeated": None, "repeated_count": 0}
+    best = max(repeated, key=repeated.get)
     return {
-        "max_multiplicity": reps[best],
+        "max_multiplicity": repeated[best],
         "most_repeated": " ".join(best),
-        "repeated_count": len(reps),
+        "repeated_count": len(repeated),
     }
 
 
@@ -352,12 +570,8 @@ def _signal_facts(wav: pathlib.Path) -> dict:
 
 
 def _word_stats(segments: list) -> dict:
-    words = [
-        (float(w["start"]), float(w["end"]))
-        for s in segments
-        for w in (s.get("words") or [])
-        if "start" in w and "end" in w
-    ]
+    timings = normalized_word_timings(segments)
+    words = [(float(w["start"]), float(w["end"])) for w in timings]
     if not words:
         return {"count": 0, "first_start": None, "last_end": None,
                 "max_internal_gap_s": None, "long_gaps_over_1s": 0}
@@ -394,6 +608,9 @@ def verdict(metrics: dict) -> tuple:
     mand = metrics["mandatory"]
     if mand["missing"]:
         reasons.append(f"mandatory missing: {mand['missing'][:5]}")
+    terminal = metrics["terminal"]
+    if not terminal["matched"]:
+        reasons.append(f"terminal phrase missing: {terminal['expected']!r}")
     conf = metrics["confidence"]
     if conf.get("no_speech_prob") is not None and conf["no_speech_prob"] >= NO_SPEECH_MAX:
         reasons.append(f"no_speech_prob {conf['no_speech_prob']:.2f} >= {NO_SPEECH_MAX}")
@@ -411,11 +628,19 @@ def verdict(metrics: dict) -> tuple:
         reasons.append(f"max internal gap {gap:.2f}s > {MAX_INTERNAL_GAP_S}s")
     if metrics["leakage"]["flagged"]:
         reasons.append(metrics["leakage"]["detail"])
+    punctuation = metrics.get("punctuation", {})
+    for kind in ("sentence_end", "colon_semicolon", "parenthetical_comma"):
+        for boundary in punctuation.get("boundaries", []):
+            if boundary.get("kind") == kind and boundary.get("passed") is False:
+                reasons.append(
+                    f"{kind} pause {boundary['gap_s']:.3f}s < {boundary['threshold_s']:.3f}s"
+                )
     return ("FAIL" if reasons else "PASS", reasons)
 
 
 # --- cache -------------------------------------------------------------------
 def _atomic_write_json(path: pathlib.Path, obj) -> None:
+
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(obj, indent=1) + "\n")
     os.replace(tmp, path)
@@ -522,6 +747,7 @@ class AsrValidator:
 
     def _cache_key(self, wav_sha: str, exp_sha: str) -> str:
         return "|".join((
+            VALIDATION_POLICY,
             self.model_repo,
             self.revision,
             self.language,
@@ -581,7 +807,10 @@ class AsrValidator:
         exp_sha = sha256_bytes(expected_text.encode("utf-8"))
         key = self._cache_key(wav_sha, exp_sha)
         cached = self._cache_get(key)
-        if cached is not None and cached.get("expected_sha256") == exp_sha:
+        if (cached is not None and cached.get("expected_sha256") == exp_sha
+                and isinstance(cached.get("terminal"), dict)
+                and isinstance(cached.get("punctuation"), dict)
+                and isinstance(cached.get("word_timings"), list)):
             return {**cached, "cache_hit": True}
 
         signal = _signal_facts(wav)
@@ -594,14 +823,17 @@ class AsrValidator:
         transcript = (result.get("text") or "").strip()
         asr_tokens = tokenize(transcript)
         expected_tokens = tokenize(expected_text)
+        word_timings = normalized_word_timings(segments)
         mand_items = derive_mandatory(expected_tokens) if mandatory is None else mandatory
         metrics = {
             "coverage": ordered_coverage(expected_tokens, asr_tokens),
             "mandatory": check_mandatory(asr_tokens, mand_items),
+            "terminal": terminal_suffix(expected_tokens, asr_tokens),
             "confidence": _confidence(segments),
-            "repetition": repetition_stats(asr_tokens),
+            "repetition": repetition_stats(asr_tokens, expected_tokens),
             "leakage": leakage_check(asr_tokens, leakage_texts or []),
             "words": _word_stats(segments),
+            "punctuation": punctuation_metrics(expected_text, word_timings),
         }
         v, reasons = verdict(metrics)
         record = {
@@ -609,16 +841,17 @@ class AsrValidator:
             "wav_sha256": wav_sha,
             "expected_sha256": exp_sha,
             "asr": {"model_repo": self.model_repo, "model_revision": self.revision},
+            "validation_policy": VALIDATION_POLICY,
             "language": self.language,
             "transcript": transcript,
             "transcript_normalized": " ".join(asr_tokens),
             "asr_tokens": asr_tokens,
             "confidence": metrics["confidence"],
             "coverage": metrics["coverage"],
-            "mandatory": metrics["mandatory"],
-            "repetition": metrics["repetition"],
-            "leakage": metrics["leakage"],
+            "terminal": metrics["terminal"],
             "words": metrics["words"],
+            "word_timings": word_timings,
+            "punctuation": metrics["punctuation"],
             "signal": signal,
             "verdict": v,
             "reasons": reasons,
@@ -649,7 +882,10 @@ class AsrValidator:
                         expected = spec.get("expected", spec.get("expected_text", ""))
                         exp_sha = sha256_bytes(expected.encode("utf-8"))
                         hit = self._cache_get(self._cache_key(wav_sha, exp_sha))
-                        if hit is not None and hit.get("expected_sha256") == exp_sha:
+                        if (hit is not None and hit.get("expected_sha256") == exp_sha
+                                and isinstance(hit.get("terminal"), dict)
+                                and isinstance(hit.get("punctuation"), dict)
+                                and isinstance(hit.get("word_timings"), list)):
                             records.append({**hit, "cache_hit": True})
                             continue
                 records.append(self.validate_chunk(
@@ -666,6 +902,10 @@ class AsrValidator:
                     "verdict": "FAIL",
                     "reasons": [f"{type(e).__name__}: {e}"],
                     "error": str(e),
+                    "validation_error": True,
+                    "terminal": {"expected": None, "matched": False},
+                    "word_timings": [],
+                    "punctuation": None,
                 })
         return records
 
@@ -712,13 +952,57 @@ def selfcheck() -> int:
         results.append((name, bool(cond)))
         print(f"  {'ok ' if cond else 'FAIL'} {name}{(' — ' + detail) if detail and not cond else ''}")
 
-    print("audiobook.asr selfcheck")
+    check("spoken century equals written year",
+          tokenize("fourteen hundred") == tokenize("1400") == ["1400"])
+    check("century equivalence reaches coverage",
+          ordered_coverage(tokenize("in fourteen hundred"),
+                           tokenize("in 1400"))["missing"] == [])
+    check("century equivalence reaches mandatory",
+          check_mandatory(tokenize("in 1400"), ["fourteen hundred"])["missing"] == [])
+    check("century equivalence reaches terminal",
+          terminal_suffix(tokenize("before fourteen hundred"),
+                          tokenize("before 1400"))["matched"])
+    check("different century remains distinct",
+          tokenize("fourteen hundred") != tokenize("fifteen hundred"))
+    check("century count continuation remains distinct",
+          tokenize("fourteen hundred one") != tokenize("1400"))
+    check("non-century prefix remains distinct",
+          tokenize("twenty hundred") != tokenize("2000"))
+    check("plural hundred remains distinct",
+          tokenize("fourteen hundreds") != tokenize("1400"))
     check("tokenize lowercases + strips punctuation",
           tokenize("The DEATH, of Tamerlane!") == ["the", "death", "of", "tamerlane"])
     check("number words -> digits", tokenize("fourteen oh five") == ["1405"])
     check("plain digits pass through", tokenize("1405") == ["1405"])
     check("hyphenated compound -> 21", tokenize("twenty-one") == ["21"])
     check("fifty -> 50", tokenize("fifty years") == ["50", "years"])
+
+    check("spoken and written ordinal equivalent",
+          tokenize("fifteenth") == tokenize("15th") and
+          tokenize("twentieth") == tokenize("20th"))
+    check("spoken decade equals written decade",
+          tokenize("thirteen thirties") == tokenize("1330s") == ["1330s"])
+    check("decade apostrophe variant equals written decade",
+          tokenize("thirteen-thirties") == tokenize("1330's") == ["1330s"])
+    check("nearby decade remains distinct",
+          tokenize("thirteen forties") != tokenize("1330s"))
+    check("decade equivalence reaches coverage",
+          ordered_coverage(tokenize("born in thirteen thirties"),
+                           tokenize("born in 1330s"))["missing"] == [])
+    check("decade equivalence reaches mandatory",
+          check_mandatory(tokenize("born in 1330s"), ["thirteen thirties"])["missing"] == [])
+    check("decade equivalence reaches terminal",
+          terminal_suffix(tokenize("born in thirteen thirties"),
+                          tokenize("born in 1330s"))["matched"])
+    check("ordinal range through thirty-first",
+          tokenize("twenty-first") == tokenize("21st") and
+          tokenize("thirty-first") == tokenize("31st"))
+    check("numeric range stays ordered",
+          tokenize("thirteen thirty-two to fourteen oh six") == tokenize("1332-1406"))
+    check("decimal spoken form equivalent",
+          tokenize("1.3") == tokenize("one point three"))
+    check("hyphenated words stay separate",
+          tokenize("well-known state-of-the-art") == ["well", "known", "state", "of", "the", "art"])
     check("apostrophes kept", tokenize("world's") == ["world's"])
 
     cov = ordered_coverage(["a", "b", "c"], ["x", "a", "b", "c"])
@@ -739,31 +1023,106 @@ def selfcheck() -> int:
           check_mandatory(["genghis", "khan", "ruled"], ["genghis khan"])["missing"] == [])
     check("mandatory rejects scattered phrase",
           check_mandatory(["khan", "x", "genghis"], ["genghis khan"])["missing"] == ["genghis khan"])
+    check("terminal suffix present",
+          terminal_suffix(tokenize("the history attempts to explain"),
+                          tokenize("the history attempts to explain"))["matched"])
+    check("terminal suffix missing",
+          not terminal_suffix(tokenize("the history attempts to explain"),
+                              tokenize("explain appears earlier but history attempts to"))["matched"])
     check("derive_mandatory content words",
           derive_mandatory(tokenize("The death of Tamerlane in 1405 was a turning point."))
           == ["tamerlane", "1405", "turning"],
           repr(derive_mandatory(tokenize("The death of Tamerlane in 1405 was a turning point."))))
 
-    rep = repetition_stats(["thank", "you", "thank", "you", "thank", "you"])
-    check("repetition loop detected", rep["max_multiplicity"] == 3, repr(rep))
-    check("repetition clean sentence",
-          repetition_stats(["the", "cat", "sat"])["repeated_count"] == 0)
     check("leakage flagged on overlap",
           leakage_check(tokenize("a b c d e"), ["a b c"])["flagged"] is True)
     check("leakage silent without texts",
           leakage_check(tokenize("a b c"), [])["flagged"] is False)
+    timing_segments = [{"words": [
+        {"word": "Fourteen", "start": 0.0, "end": 0.2},
+        {"word": "oh", "start": 0.21, "end": 0.3},
+        {"word": "five:", "start": 0.4, "end": 0.5},
+        {"word": "Tamerlane", "start": 0.61, "end": 0.8},
+        {"word": "returns", "start": 0.95, "end": 1.1},
+    ]}]
+    timings = normalized_word_timings(timing_segments)
+    check("normalized timing entries are JSON-native",
+          timings == [
+              {"text": "1405", "start": 0.0, "end": 0.5},
+              {"text": "tamerlane", "start": 0.61, "end": 0.8},
+              {"text": "returns", "start": 0.95, "end": 1.1},
+          ] and json.loads(json.dumps(timings)) == timings)
+    source = "Alpha ends. Beta follows: Gamma (aside), delta, quiet."
+    words = [
+        {"text": text, "start": i * 0.3, "end": i * 0.3 + 0.1}
+        for i, text in enumerate(tokenize(source))
+    ]
+    punctuation = punctuation_metrics(source, words)
+    check("sentence punctuation pause passes",
+          punctuation["sentence_end"]["passed"] == 1 and
+          punctuation["sentence_end"]["unaligned"] == 1)
+    check("colon punctuation pause passes",
+          punctuation["colon_semicolon"]["passed"] == 1)
+    check("parenthetical comma pause passes",
+          punctuation["parenthetical_comma"]["passed"] == 1)
+    check("ordinary comma is advisory",
+          punctuation["comma"]["checked"] == 1 and punctuation["comma"]["failed"] == 0)
+    short_words = words[:2] + words[3:]
+    diagnostic = punctuation_metrics(source, short_words)
+    check("unaligned punctuation stays diagnostic",
+          diagnostic["sentence_end"]["unaligned"] > 0 and
+          diagnostic["sentence_end"]["failed"] == 0)
+    check("short sentence pause fails verdict",
+          verdict({"coverage": {"fraction": 1, "matched_tokens": 1, "expected_tokens": 1, "missing": []},
+                   "mandatory": {"missing": []}, "terminal": {"matched": True, "expected": ""},
+                   "confidence": {}, "repetition": {"max_multiplicity": 0},
+                   "words": {"max_internal_gap_s": 0}, "leakage": {"flagged": False},
+                   "punctuation": {"boundaries": [{"kind": "sentence_end", "gap_s": 0.1,
+                                                     "threshold_s": 0.15, "passed": False}]}})[0] == "FAIL")
 
     good = {
         "coverage": {"fraction": 0.96, "matched_tokens": 24, "expected_tokens": 25, "missing": []},
         "mandatory": {"missing": []},
+        "terminal": {"expected": "attempts to explain", "matched": True},
         "confidence": {"avg_logprob": -0.2, "no_speech_prob": 0.01, "compression_ratio": 1.1},
         "repetition": {"max_multiplicity": 1},
         "words": {"max_internal_gap_s": 0.4},
         "leakage": {"flagged": False},
     }
+    rep = repetition_stats(tokenize("thank you thank you thank you"), tokenize("thank you"))
+    check("repetition x3 vs expected once fails",
+          rep["max_multiplicity"] == 3 and
+          verdict({**good, "repetition": rep})[0] == "FAIL", repr(rep))
+    check("expected repetition accepted",
+          repetition_stats(tokenize("thank you thank you thank you"),
+                           tokenize("thank you thank you thank you"))["max_multiplicity"] == 0)
+    schema_terminal = terminal_suffix(tokenize("alpha omega"), tokenize("alpha omega"))
+    schema_punctuation = punctuation_metrics("Alpha ends. Beta follows.", [
+        {"text": text, "start": i * 0.4, "end": i * 0.4 + 0.1}
+        for i, text in enumerate(tokenize("Alpha ends Beta follows"))
+    ])
+    schema_record = {"terminal": schema_terminal, "word_timings": timings,
+                     "punctuation": schema_punctuation, "verdict": "PASS"}
+    serialized = json.loads(json.dumps(schema_record))
+    check("serialized record preserves terminal matched state",
+          serialized["terminal"] == {"expected": "alpha omega", "matched": True})
+    missing_terminal = terminal_suffix(tokenize("alpha omega"), tokenize("alpha"))
+    check("serialized record preserves terminal missing state",
+          json.loads(json.dumps({"terminal": missing_terminal}))["terminal"]["matched"] is False)
+    check("serialized record preserves exact punctuation schema",
+          set(serialized["punctuation"]) == {"boundaries", "sentence_end", "colon_semicolon",
+                                               "parenthetical_comma", "comma"} and
+          set(serialized["punctuation"]["boundaries"][0]) == {
+              "kind", "punctuation", "expected_token_index", "asr_token_index",
+              "next_asr_token_index", "aligned", "gap_s", "threshold_s", "passed"})
+    check("record fields remain JSON-native", serialized == schema_record)
+    check("repetition clean sentence",
+          repetition_stats(["the", "cat", "sat"])["repeated_count"] == 0)
     check("verdict PASS on clean chunk", verdict(good)[0] == "PASS")
     bad = {**good, "coverage": {**good["coverage"], "fraction": 0.5}}
     check("verdict FAIL on truncated chunk", verdict(bad)[0] == "FAIL")
+    bad = {**good, "terminal": {"expected": "attempts to explain", "matched": False}}
+    check("verdict FAIL on missing terminal phrase", verdict(bad)[0] == "FAIL")
 
     def ck(**kw):
         return AsrValidator(**kw)._cache_key("W1", "E1")

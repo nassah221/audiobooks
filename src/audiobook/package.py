@@ -76,33 +76,31 @@ def build(root, out_dir, with_chapters_wav):
     adj.classify()
     blocked = [d for d in adj.decisions if d[3].startswith("BLOCK")]
     if blocked:
-        raise RuntimeError("current adjudication decisions contain blocked chunks: "
+        raise RuntimeError("current adjudication decisions contain blocked paragraphs: "
                            + ", ".join(d[0]["id"] for d in blocked[:8]))
-    # Always rebuild from current decisions; the existing override WAV may be stale.
     assembled = adj.concatenate()
-    state = json.loads((out / runner.STATE_REL).read_text())
-    done = state["done"]
     included = [d for d in adj.decisions if d[3] in INCLUDED]
-    plan_idx = {c["id"]: i for i, c in enumerate(adj.plan["chunks"])}
-    included.sort(key=lambda d: plan_idx[d[0]["id"]])
 
-    by_ag_chapter = {}
-    for chunk, wav, rec, dec, det in included:
-        by_ag_chapter.setdefault(chunk["chapter"], []).append(
-            (chunk, wav, done[chunk["id"]]["samples"]))
+    by_chapter = {}
+    for paragraph, wav, rec, dec, det in included:
+        by_chapter.setdefault(paragraph["chapter"], []).append((paragraph, wav))
 
     chapters = []
     cur = 0
     titles = {c["id"]: c["title"] for c in adj.plan["chapters"]}
-    for ch in (c["id"] for c in adj.plan["chapters"]):
-        if ch not in by_ag_chapter:
+    for plan_ch in adj.plan["chapters"]:
+        ch = plan_ch["id"]
+        paragraphs = by_chapter.get(ch)
+        if not paragraphs:
             continue
-        samples = sum(s for _, _, s in by_ag_chapter[ch])
+        import soundfile as sf
+        samples = sum(int(sf.info(str(wav)).frames) for _, wav in paragraphs)
         start_ms = int(round(cur * 1000 / runner.SAMPLE_RATE))
         cur += samples
         end_ms = int(round(cur * 1000 / runner.SAMPLE_RATE))
         chapters.append({"id": ch, "title": titles[ch], "start_ms": start_ms,
-                         "end_ms": end_ms, "seconds": (end_ms - start_ms) / 1000})
+                         "end_ms": end_ms, "seconds": (end_ms - start_ms) / 1000,
+                         "paragraphs": len(paragraphs)})
 
     meta_values = {
         "title": epub_meta.get("title", TITLE),
@@ -130,18 +128,21 @@ def build(root, out_dir, with_chapters_wav):
     if with_chapters_wav:
         ch_dir = out / "chapters"
         ch_dir.mkdir(exist_ok=True)
-        import soundfile as sf
         for c in chapters:
-            wavs = [w for _, w, _ in by_ag_chapter[c["id"]]]
-            total = sum(s for _, _, s in by_ag_chapter[c["id"]])
+            paragraphs = by_chapter[c["id"]]
+            total = sum(int(__import__("soundfile").info(str(wav)).frames)
+                        for _, wav in paragraphs)
             dst = ch_dir / f"{c['id']}.wav"
             tmp = dst.with_name(dst.name + ".tmp")
             with open(tmp, "wb") as fh:
                 fh.write(runner.Generator._wav_header_bytes(total))
-                for w in wavs:
-                    fh.write(w.read_bytes()[44:])
+                for _, wav in paragraphs:
+                    with open(wav, "rb") as src:
+                        src.seek(44)
+                        for data in iter(lambda: src.read(1 << 20), b""):
+                            fh.write(data)
             tmp.replace(dst)
-            print(f"  chapter {c['id']} -> {dst.relative_to(root)} ({len(wavs)} sentences, {c['seconds']:.0f}s)")
+            print(f"  chapter {c['id']} -> {dst.relative_to(root)} ({c['paragraphs']} paragraphs, {c['seconds']:.0f}s)")
 
     book_wav = out / adjudicate.BOOK_OVERRIDE_REL
     m4b = out / f"{TITLE.replace(' ', '')}.m4b"

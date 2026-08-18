@@ -18,6 +18,7 @@ repo = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
 revision = "a6eb4f68e4b056f1215157bb696209bc82a6db48"
 language = "English"
 max_tokens = 4096
+seed = 42
 
 [asr]
 repo = "mlx-community/whisper-large-v3-turbo"

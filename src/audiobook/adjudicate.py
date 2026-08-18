@@ -40,11 +40,12 @@ import hashlib
 import json
 import pathlib
 import re
-import shutil
+import os
 import sys
 import time
 
 from . import runner
+
 from .config import load_config
 
 # Policy identity (versioned; the ledger records it per decision).
@@ -60,6 +61,7 @@ MAX_INTERNAL_GAP_S = 2.5
 # Lenient per-token match floor and overall lenient coverage floor.
 LENIENT_RATIO = 0.52
 COVERAGE_MIN = 0.85
+INCLUDED = {"PASS", "ALLOW_LEXICAL", "ALLOW_LEXICAL_NAME"}
 
 LEDGER_REL = "validation/adjudication-ledger.jsonl"
 BACKUP_REL = "validation/failures-backup"
@@ -228,8 +230,12 @@ def _sha256(p: pathlib.Path) -> str:
     return h.hexdigest()
 
 
+def asr_policy():
+    from . import asr
+    return asr.VALIDATION_POLICY
+
 def selfcheck() -> int:
-    """Runnable check for the non-trivial adjudication logic (no models)."""
+    """Runnable check for adjudication and assembly logic (no models)."""
     results = []
 
     def check(name, cond, detail=""):
@@ -294,6 +300,58 @@ def selfcheck() -> int:
         "signal": {"full_scale_samples": 0}, "words": {"max_internal_gap_s": 0.1}})
     check("marginal confidence flagged without override", not hp and any("avg_logprob" in r for r in reasons))
 
+    # Parent fallback must assemble its ordered children and publish the WAV.
+    import struct
+    import tempfile
+    import wave
+
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        sources = []
+        for name, sample in (("child-1.wav", 1000), ("child-2.wav", 2000)):
+            path = root / name
+            with wave.open(str(path), "wb") as fh:
+                fh.setnchannels(1)
+                fh.setsampwidth(2)
+                fh.setframerate(runner.SAMPLE_RATE)
+                fh.writeframes(struct.pack("<h", sample))
+            sources.append(path)
+        children = []
+        decisions = [( {
+            "id": "parent", "text": "parent", "text_sha256": "parent-hash",
+        }, None, None, "OMIT_PARENT_FALLBACK", [])]
+        for i, (path, sample) in enumerate(zip(sources, (1000, 2000))):
+            child = {
+                "id": f"child-{i + 1}", "parent_id": "parent", "child_index": i,
+                "chapter": "test", "paragraph_index": 1, "source_span": [i, i + 1],
+                "text": f"child {i + 1}", "text_sha256": f"child-hash-{i + 1}",
+            }
+            children.append(child)
+            decisions.append((child, path, None, "PASS", []))
+        adj = Adjudicator.__new__(Adjudicator)
+        adj.out_dir = root
+        adj.decisions = decisions
+        adj.done = {c["id"]: {"wav_sha256": _sha256(path)}
+                    for c, path, *_ in decisions if path}
+        book = adj.concatenate()
+        published = root / BOOK_OVERRIDE_REL
+        import soundfile as sf
+        info = sf.info(str(published))
+        with wave.open(str(published), "rb") as fh:
+            payload = struct.unpack("<%dh" % fh.getnframes(), fh.readframes(fh.getnframes()))
+        expected_padding = int(round(0.25 * runner.SAMPLE_RATE))
+        check("parent fallback publishes assembled WAV",
+              published.is_file() and not (root / (published.name + ".tmp")).exists())
+        check("assembly verifies expected frames and PCM format",
+              int(info.frames) == 2 + expected_padding and
+              int(info.samplerate) == runner.SAMPLE_RATE and info.channels == 1 and
+              info.subtype == "PCM_16", f"info={info}")
+        check("assembly preserves child order and padding",
+              payload[0] == 1000 and
+              payload[1:1 + expected_padding] == (0,) * expected_padding and
+              payload[-1] == 2000 and
+              book["inserted_silence_samples"] == expected_padding)
+
     failed = [n for n, okk, _ in results if not okk]
     for n, okk, det in results:
         print(("ok  " if okk else "FAIL"), n, det)
@@ -306,100 +364,159 @@ class Adjudicator:
         self.root = pathlib.Path(root)
         self.out_dir = pathlib.Path(out_dir)
         self.cfg = load_config(self.root)
-        self.plan = runner.build_plan(self.root, self.cfg)
-        self.by_id = {c["id"]: c for c in self.plan["chunks"]}
         self.ledger_path = self.out_dir / LEDGER_REL
         self.backup_dir = self.out_dir / BACKUP_REL
-        self._read_state()
-        self._read_cache()
-        self.decisions = []  # ordered list of (chunk, wav, rec|None, decision, detail)
+        state_path = self.out_dir / runner.STATE_REL
+        try:
+            stored = json.loads(state_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"cannot read generation state at {state_path}: {exc}") from exc
+        plan_state = stored.get("plan") or {}
+        chapters = [c["id"] for c in plan_state.get("chapters") or []]
+        self.plan = runner.build_plan(self.root, self.cfg,
+                                      chapters=",".join(chapters) or None,
+                                      limit=plan_state.get("total_groups"))
+        self.state = self._read_state()
+        self.done = self.state.get("done") or {}
+        self.records = self._read_records()
+        self.decisions = []
+        self.name_set = set()
 
     def _read_state(self):
-        st = json.loads((self.out_dir / runner.STATE_REL).read_text())
-        self.done = st.get("done", {})
+        path = self.out_dir / runner.STATE_REL
+        if not path.is_file():
+            raise RuntimeError(f"no generation state at {path}; run generate first")
+        try:
+            st = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"cannot read generation state at {path}: {exc}") from exc
+        ref = st.get("reference") or {}
         fp = st.get("fingerprint")
-        if fp != runner.run_fingerprint(self.cfg, self.reference_sha("audio"), self.reference_sha("text")):
-            raise RuntimeError("state fingerprint does not match current config; re-run generate")
-        self.plan_ok = (st.get("plan", {}).get("chunk_ids") == [c["id"] for c in self.plan["chunks"]])
+        expected_fp = runner.run_fingerprint(
+            self.cfg, ref.get("wav_sha256"), ref.get("text_sha256"))
+        if not fp or fp != expected_fp:
+            raise RuntimeError("state fingerprint does not match current config/reference; re-run generate")
+        state_plan = st.get("plan")
+        matcher = getattr(runner, "_state_plan_matches", None)
+        if not matcher or not matcher(state_plan, self.plan):
+            raise RuntimeError("state plan does not match the current chunk planner; re-run generate")
+        if state_plan.get("total_groups") != len(state_plan.get("chunk_ids") or []):
+            raise RuntimeError("state plan has an incomplete chunk count; re-run generate")
+        return st
 
-    def reference_sha(self, which):
-        # hashes recorded in state['reference']
-        st = json.loads((self.out_dir / runner.STATE_REL).read_text())
-        return st.get("reference", {}).get("wav_sha256" if which == "audio" else "text_sha256")
+    def _read_records(self):
+        path = self.out_dir / runner.RECORDS_REL
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text())
+            records = payload.get("records", [])
+        except (OSError, json.JSONDecodeError, AttributeError) as exc:
+            raise RuntimeError(f"cannot read validation records at {path}") from exc
+        if not isinstance(records, list):
+            raise RuntimeError(f"validation records at {path} are not a list")
+        out = {}
+        for rec in records:
+            if isinstance(rec, dict) and rec.get("chunk_id"):
+                out[rec["chunk_id"]] = rec
+        return out
 
-    def _read_cache(self):
-        path = self.out_dir / runner.ASR_CACHE_REL
-        recs = json.loads(path.read_text()).values() if path.is_file() else []
-        self.records = {}
-        for r in recs:
-            a = r.get("asr") or {}
-            if (a.get("model_repo") == self.cfg.asr_repo and
-                    a.get("model_revision") == self.cfg.asr_revision):
-                self.records[r.get("chunk_id")] = r
+    def _classify_unit(self, chunk, parent):
+        """Classify one checkpoint against its immutable planned source unit."""
+        chunk_id = chunk["id"]
+        text = chunk.get("text")
+        expected_hash = runner.sha256_text(text) if isinstance(text, str) else None
+        done = self.done.get(chunk_id)
+        if not done or not done.get("wav"):
+            return (chunk, None, None, "BLOCK_MISSING", ["unit WAV not generated"])
+        if not isinstance(text, str) or expected_hash != chunk.get("text_sha256"):
+            return (chunk, None, None, "BLOCK_STALE_TEXT", ["planned unit text hash mismatch"])
+        if done.get("text_sha256") != expected_hash:
+            return (chunk, None, None, "BLOCK_STALE_TEXT", ["checkpoint text hash mismatch"])
+        wav = self.out_dir / done["wav"]
+        if not wav.is_file():
+            return (chunk, wav, None, "BLOCK_MISSING", ["unit WAV not generated"])
+        actual_wav_sha = _sha256(wav)
+        if done.get("wav_sha256") != actual_wav_sha:
+            return (chunk, wav, None, "BLOCK_STALE_WAV", ["checkpoint WAV hash mismatch"])
+        if not re.search(r"[A-Za-z]", text):
+            return (chunk, wav, None, "OMIT_UNSPEAKABLE", ["non-speech text"])
+        rec = self.records.get(chunk_id)
+        if rec is None or rec.get("chunk_id") != chunk_id:
+            return (chunk, wav, rec, "BLOCK_UNVALIDATED", ["no current ASR record"])
+        if (rec.get("expected_sha256") != expected_hash or
+                rec.get("wav_sha256") != actual_wav_sha):
+            return (chunk, wav, rec, "BLOCK_STALE_VALIDATION",
+                    ["ASR text/WAV hash does not match checkpoint"])
+        if rec.get("validation_policy") != asr_policy():
+            return (chunk, wav, rec, "BLOCK_STALE_VALIDATION",
+                    ["ASR validation policy is stale"])
+        cfg = rec.get("asr") or {}
+        if (cfg.get("model_repo") != self.cfg.asr_repo or
+                cfg.get("model_revision") != self.cfg.asr_revision):
+            return (chunk, wav, rec, "BLOCK_STALE_VALIDATION",
+                    ["ASR model configuration is stale"])
+        if runner._take_passes(rec):
+            return (chunk, wav, rec, "PASS", [])
+        if rec.get("verdict") == "PASS":
+            return (chunk, wav, rec, "BLOCK_STRUCTURAL", ["strict release gate failed"])
+        hp, why = hard_gates_pass(rec)
+        loop, loop_why = repetition_is_loop(rec, text)
+        if why and all("avg_logprob" in r for r in why):
+            exp_n = [_norm(t) for t in text.split()]
+            asr_n = [_norm(t) for t in (rec.get("transcript") or "").split()]
+            if exp_n and exp_n == asr_n:
+                hp, why = True, []
+        if not hp or loop:
+            return (chunk, wav, rec, "BLOCK_STRUCTURAL",
+                    why + ([loop_why] if loop else []))
+        cov, miss, all_fragile = lenient_coverage(text, rec.get("transcript"), self.name_set)
+        if cov >= COVERAGE_MIN or (all_fragile and miss):
+            code = "ALLOW_LEXICAL" if cov >= COVERAGE_MIN else "ALLOW_LEXICAL_NAME"
+            return (chunk, wav, rec, code,
+                    [f"lenient_cov={cov:.2f}", f"unmatched={miss[:8]}"])
+        return (chunk, wav, rec, "BLOCK_LOW_COVERAGE",
+                [f"lenient_cov={cov:.2f}", f"unmatched={miss[:8]}"])
+
+    def _planned_children(self, parent):
+        """Use runner's child schema, retaining source order and span identity."""
+        return runner.Generator._child_chunks(self, parent)
 
     def classify(self):
-        # Book-specific proper-noun lexicon: title-cased tokens anywhere plus
-        # every token in the 'names' chapter (a glossary of names/dynasties).
         name_set = set()
-        for c in self.plan["chunks"]:
-            toks = [t for t in re.split(r"\s+", c["text"]) if re.search(r"[A-Za-z]", t)]
-            for t in toks:
-                if t[0].isupper():
-                    name_set.add(_norm(t))
-            if c["chapter"] == "names":
-                for t in toks:
-                    name_set.add(_norm(t))
+        for parent in self.plan.get("chunks", []):
+            toks = [t for t in re.split(r"\s+", parent.get("text", ""))
+                    if re.search(r"[A-Za-z]", t)]
+            for tok in toks:
+                if tok[0].isupper():
+                    name_set.add(_norm(tok))
+            if parent.get("chapter") == "names":
+                name_set.update(_norm(tok) for tok in toks)
         self.name_set = name_set
-        for chunk in self.plan["chunks"]:
-            cid = chunk["id"]
-            wav_rel = (self.done.get(cid) or {}).get("wav")
-            wav = self.out_dir / wav_rel if wav_rel else None
-            if not wav or not wav.is_file():
-                self.decisions.append((chunk, wav, None, "BLOCK_MISSING", ["chunk not generated"]))
+        self.decisions = []
+        for parent in self.plan.get("chunks", []):
+            parent_decision = self._classify_unit(parent, parent)
+            if parent_decision[3] in INCLUDED:
+                self.decisions.append(parent_decision)
                 continue
-            if not re.search(r"[A-Za-z]", chunk["text"]):
-                # Unspeakable marker ('*', em-dash, ...): silent placeholder,
-                # intentionally omitted from the audiobook (never read aloud).
-                self.decisions.append((chunk, wav, None, "OMIT_UNSPEAKABLE", ["non-speech text"]))
+            children = self._planned_children(parent)
+            if not children:
+                self.decisions.append(parent_decision)
                 continue
-            rec = self.records.get(cid)
-            if rec is None:
-                self.decisions.append((chunk, wav, None, "BLOCK_UNVALIDATED", ["no ASR record"]))
-                continue
-            if rec.get("verdict") == "PASS":
-                self.decisions.append((chunk, wav, rec, "PASS", []))
-                continue
-            hp, why = hard_gates_pass(rec)
-            loop, loop_why = repetition_is_loop(rec, chunk["text"])
-            # Override a marginal avg_logprob structural flag when the ASR
-            # transcript is an exact (normalized) content match to the expected
-            # text -- e.g. a trivial one-word utterance whisper rendered right
-            # but with only slightly-low confidence.
-            if why and all("avg_logprob" in r for r in why):
-                exp_n = [_norm(t) for t in chunk["text"].split()]
-                asr_n = [_norm(t) for t in (rec.get("transcript") or "").split()]
-                if exp_n and exp_n == asr_n:
-                    hp, why = True, []
-            if not hp or loop:
-                self.decisions.append((chunk, wav, rec, "BLOCK_STRUCTURAL",
-                                       why + ([loop_why] if loop else [])))
-                continue
-            cov, miss, all_fragile = lenient_coverage(
-                chunk["text"], rec.get("transcript"), name_set)
-            if cov >= COVERAGE_MIN or (all_fragile and miss):
-                code = "ALLOW_LEXICAL" if cov >= COVERAGE_MIN else "ALLOW_LEXICAL_NAME"
-                self.decisions.append((chunk, wav, rec, code,
-                                       [f"lenient_cov={cov:.2f}", f"unmatched={miss[:8]}"]))
-            else:
-                self.decisions.append((chunk, wav, rec, "BLOCK_LOW_COVERAGE",
-                                       [f"lenient_cov={cov:.2f}", f"unmatched={miss[:8]}"]))
+            child_decisions = [self._classify_unit(child, parent) for child in children]
+            complete = all(d[3] in INCLUDED for d in child_decisions)
+            parent_decision = (parent, parent_decision[1], parent_decision[2],
+                               "OMIT_PARENT_FALLBACK" if complete else "BLOCK_CHILD_INCOMPLETE",
+                               (["parent unavailable; using ordered children"] if complete
+                                else ["parent unavailable; child set is incomplete"]))
+            self.decisions.append(parent_decision)
+            self.decisions.extend(child_decisions)
 
-    def summary(self) -> dict:
+    def summary(self):
         from collections import Counter
-        counts = Counter(d[3] for d in self.decisions)
-        return dict(counts)
+        return dict(Counter(d[3] for d in self.decisions))
 
-    def _backup(self, chunk, wav):
+    def _backup(self, paragraph, wav):
         dest = self.backup_dir / wav.name
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.exists():
@@ -410,96 +527,134 @@ class Adjudicator:
         mode = "a" if self.ledger_path.exists() else "w"
         now = int(time.time())
         with open(self.ledger_path, mode) as fh:
-            for chunk, wav, rec, decision, detail in self.decisions:
+            for paragraph, wav, rec, decision, detail in self.decisions:
                 entry = {
-                    "policy_id": POLICY_ID,
-                    "ts_unix": now,
-                    "chunk_id": chunk["id"],
-                    "expected": chunk["text"],
-                    "decision": decision,
-                    "detail": detail,
-                    "wav_sha256": _sha256(wav) if wav else None,
+                    "policy_id": POLICY_ID, "ts_unix": now,
+                    "paragraph_id": paragraph["id"],
+                    "parent_id": paragraph.get("parent_id") or paragraph["id"],
+                    "child_index": paragraph.get("child_index"),
+                    "chapter": paragraph.get("chapter"),
+                    "paragraph_index": paragraph.get("paragraph_index"),
+                    "source_span": paragraph.get("source_span"),
+                    "expected": paragraph.get("text"),
+                    "expected_sha256": paragraph.get("text_sha256"),
+                    "decision": decision, "detail": detail,
+                    "wav": str(wav.relative_to(self.out_dir)) if wav else None,
+                    "wav_sha256": _sha256(wav) if wav and wav.is_file() else None,
                 }
                 if rec:
                     entry["raw_verdict"] = rec.get("verdict")
                     entry["asr_transcript"] = rec.get("transcript")
                     entry["raw_reasons"] = rec.get("reasons")
-                    entry["asr_model"] = (rec.get("asr") or {}).get("model_repo")
+                    entry["asr_model"] = rec.get("asr")
+                    entry["asr_policy"] = rec.get("validation_policy")
                 fh.write(json.dumps(entry) + "\n")
 
-    def concatenate(self) -> dict:
-        """Byte-exact concatenation of PASS+ALLOW chunks in plan order."""
+    def concatenate(self):
+        """Assemble accepted chunks and atomically publish a verified WAV."""
         import soundfile as sf
-        total_frames = 0
-        wavs, ids = [], []
-        for chunk, wav, rec, decision, detail in self.decisions:
-            if decision not in ("PASS", "ALLOW_LEXICAL", "ALLOW_LEXICAL_NAME"):
-                continue
+        accepted = [d for d in self.decisions if d[3] in INCLUDED]
+        if any(d[3].startswith("BLOCK") for d in self.decisions):
+            raise RuntimeError("cannot assemble: blocked chunk would leave a gap")
+        chunks, wavs, rows = [], [], []
+        for chunk, wav, rec, decision, detail in accepted:
             info = sf.info(str(wav))
-            if int(info.samplerate) != runner.SAMPLE_RATE or info.channels != 1 or info.subtype != "PCM_16":
+            if (int(info.samplerate) != runner.SAMPLE_RATE or int(info.channels) != 1 or
+                    info.subtype != "PCM_16"):
                 raise RuntimeError(f"{chunk['id']} unexpected format {info}")
-            total_frames += int(info.frames)
+            if _sha256(wav) != self.done[chunk["id"]].get("wav_sha256"):
+                raise RuntimeError(f"{chunk['id']} WAV changed after adjudication")
+            chunks.append(chunk)
             wavs.append(pathlib.Path(wav))
-            ids.append(chunk["id"])
+            rows.append((chunk, wav, rec, decision, detail, int(info.frames)))
+        parts = runner.Generator._assembly_parts(chunks, wavs)
+        inserted = sum(frames for _, frames in parts)
+        total_frames = sum(row[-1] for row in rows) + inserted
         out = self.out_dir / BOOK_OVERRIDE_REL
         tmp = out.with_name(out.name + ".tmp")
-        with open(tmp, "wb") as fh:
-            fh.write(runner.Generator._wav_header_bytes(total_frames))
-            for w in wavs:
-                data = w.read_bytes()
-                fh.write(data[44:])  # strip each source's 44-byte header
-        if not runner.Generator._payload_bytes_equal(tmp, wavs):
-            raise RuntimeError("override book payload != exact concatenation")
-        tmp.replace(out)  # atomic promote: overwrite out with the temp
-        return {"wav": BOOK_OVERRIDE_REL, "seconds": round(total_frames / runner.SAMPLE_RATE, 3),
-                "chunks": len(ids), "sentences": ids}
-
-    def write_manifest(self, book: dict):
+        try:
+            runner.Generator._write_assembly(tmp, total_frames, parts)
+            info = sf.info(str(tmp))
+            if (int(info.samplerate) != runner.SAMPLE_RATE or int(info.channels) != 1 or
+                    info.subtype != "PCM_16" or int(info.frames) != total_frames):
+                raise RuntimeError(f"assembled override has unexpected format {info}")
+            os.replace(tmp, out)
+            info = sf.info(str(out))
+            if (int(info.samplerate) != runner.SAMPLE_RATE or int(info.channels) != 1 or
+                    info.subtype != "PCM_16" or int(info.frames) != total_frames):
+                raise RuntimeError(f"published override has unexpected format {info}")
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        padding_after = {}
+        for i, chunk in enumerate(chunks[:-1]):
+            padding_after[chunk["id"]] = runner.Generator._boundary_padding_frames(
+                chunk, wavs[i], chunks[i + 1], wavs[i + 1])
+        pos, offsets = 0, []
+        for chunk, wav, rec, decision, detail, frames in rows:
+            offsets.append({
+                "id": chunk["id"], "parent_id": chunk.get("parent_id") or chunk["id"],
+                "child_index": chunk.get("child_index"),
+                "chapter": chunk.get("chapter"),
+                "paragraph_index": chunk.get("paragraph_index"),
+                "source_span": chunk.get("source_span"),
+                "text": chunk["text"], "text_sha256": chunk["text_sha256"],
+                "wav": str(wav.relative_to(self.out_dir)),
+                "wav_sha256": _sha256(wav), "decision": decision,
+                "start_sample": pos, "end_sample": pos + frames,
+                "seconds": round(frames / runner.SAMPLE_RATE, 4),
+                "silence_after_samples": padding_after.get(chunk["id"], 0),
+            })
+            pos += frames + padding_after.get(chunk["id"], 0)
+        return {"wav": BOOK_OVERRIDE_REL,
+                "seconds": round(total_frames / runner.SAMPLE_RATE, 3),
+                "inserted_silence_samples": inserted, "paragraphs": offsets}
+    def write_manifest(self, book):
+        accepted_ids = {d[0]["id"] for d in self.decisions if d[3] in INCLUDED}
         man = {
             "policy_id": POLICY_ID,
             "book": BOOK_OVERRIDE_REL,
-            "method": "byte-exact concatenation of PASS + ALLOW_LEXICAL chunk payloads, zero inserted samples",
+            "method": "PCM16 chunk concatenation with minimum 250 ms sentence and 500 ms paragraph pauses",
             "sample_rate": runner.SAMPLE_RATE,
             "channels": 1,
             "subtype": "PCM_16",
-            "chunks": book["chunks"],
+            "chunks": book["paragraphs"],
+            "chunk_count": len(book["paragraphs"]),
             "seconds": book["seconds"],
+            "inserted_silence_samples": book["inserted_silence_samples"],
             "sha256": _sha256(self.out_dir / BOOK_OVERRIDE_REL),
             "ledger": LEDGER_REL,
-            "excluded": [d[0]["id"] for d in self.decisions
-                         if d[3] not in ("PASS", "ALLOW_LEXICAL", "ALLOW_LEXICAL_NAME")],
+            "excluded": [d[0]["id"] for d in self.decisions if d[0]["id"] not in accepted_ids],
         }
         (self.out_dir / MANIFEST_OVERRIDE_REL).write_text(json.dumps(man, indent=1) + "\n")
 
     def run(self, dry_run, write, assemble):
         self.classify()
         s = self.summary()
-        print(f"adjudicate [{POLICY_ID}] on {len(self.decisions)} chunks")
-        for k in ("PASS", "ALLOW_LEXICAL", "ALLOW_LEXICAL_NAME", "OMIT_UNSPEAKABLE",
-                  "BLOCK_STRUCTURAL", "BLOCK_LOW_COVERAGE", "BLOCK_MISSING",
-                  "BLOCK_UNVALIDATED"):
-            if s.get(k):
-                print(f"  {k}: {s[k]}")
+        print(f"adjudicate [{POLICY_ID}] on {len(self.plan.get('chunks', []))} paragraphs")
+        for key, value in sorted(s.items()):
+            if value:
+                print(f"  {key}: {value}")
         blocked = [d for d in self.decisions if d[3].startswith("BLOCK")]
-        for chunk, wav, rec, decision, detail in blocked:
-            print(f"  {decision} {chunk['id']}: {'; '.join(detail)}")
+        for paragraph, wav, rec, decision, detail in blocked:
+            print(f"  {decision} {paragraph['id']}: {'; '.join(detail)}")
         if dry_run:
             return 1 if blocked else 0
         if write or assemble:
-            for chunk, wav, rec, decision, detail in self.decisions:
+            for paragraph, wav, rec, decision, detail in self.decisions:
                 if decision != "PASS" and wav:
-                    self._backup(chunk, wav)
+                    self._backup(paragraph, wav)
             self.write_ledger()
             print(f"  ledger -> {self.ledger_path}")
-            print(f"  failing WAV backups -> {self.backup_dir}")
         if assemble:
             if blocked:
-                print("  assembly SKIPPED: blocked chunks present (excluded would leave a gap)")
+                print("  assembly SKIPPED: rejected chunk would leave a gap")
                 return 1
             book = self.concatenate()
             self.write_manifest(book)
-            print(f"  assembled {book['wav']} ({book['seconds']}s audio, {book['chunks']} chunks)")
+            print(f"  assembled {book['wav']} ({book['seconds']}s audio, {len(book['paragraphs'])} chunks)")
         return 1 if blocked else 0
+
 
 
 def main(argv=None) -> int:
