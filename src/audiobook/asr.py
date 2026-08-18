@@ -28,7 +28,7 @@ Record schema (all values JSON-native):
     transcript, transcript_normalized, asr_tokens,
     confidence: {avg_logprob, no_speech_prob, compression_ratio},
     coverage: {expected_tokens, matched_tokens, fraction, missing},
-    mandatory: {items, missing, missing_fragile, phonetic_matches, hyphen_matches},
+    mandatory: {items, missing, missing_fragile, phonetic_matches, hyphen_matches, vowel_matches},
     terminal: {expected, matched},
     repetition: {max_multiplicity, most_repeated, repeated_count}
     leakage: {flagged, detail},
@@ -65,7 +65,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v21-unified-lexical-equivalence"
+VALIDATION_POLICY = "paragraph-v22-vowel-transliteration"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -619,14 +619,48 @@ def ordered_coverage(expected: list, asr: list) -> dict:
     }
 
 
+_VOWELS = set("aeiouy")
+
+
+def _is_vowel_swap(a: str, b: str) -> bool:
+    """True when `a` and `b` are the same length, both >= 4 characters, and
+    differ in exactly one position by a vowel-for-vowel substitution
+    (a/e/i/o/u/y) -- a loanword transliteration variant Whisper prefers
+    ("amir" -> "emir"), the same vocabulary-snapping phenomenon as v12's
+    phonetic matching but one letter gentler. A consonant difference, or
+    any insertion/deletion (a length difference), does not count -- only
+    an exact single vowel-for-vowel substitution."""
+    if len(a) != len(b) or len(a) < 4:
+        return False
+    diff = None
+    for ca, cb in zip(a, b):
+        if ca == cb:
+            continue
+        if diff is not None:
+            return False
+        diff = (ca, cb)
+    return diff is not None and diff[0] in _VOWELS and diff[1] in _VOWELS
+
+
 def _tok_eq(a: str, b: str, ratio: float) -> bool:
     if a == b:
         return True
     # phonetic tolerance for proper nouns ("Tamerlane" ~ "Tamalane") without
     # letting short function words match anything
     if len(a) >= 4 and len(b) >= 4:
+        if _is_vowel_swap(a, b):
+            return True
         return difflib.SequenceMatcher(None, a, b).ratio() >= ratio
     return False
+
+
+def _find_vowel_match(word: str, asr: list) -> str:
+    """First ASR token that is a vowel-swap transliteration variant of
+    `word` (see `_is_vowel_swap`), or None."""
+    for candidate in asr:
+        if _is_vowel_swap(word, candidate):
+            return candidate
+    return None
 
 
 def _phrase_in(asr: list, phrase: list, ratio: float) -> bool:
@@ -805,12 +839,17 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
     token), but its absence alone never fails the verdict. Phonetic matches
     and hyphen matches are additionally recorded (`phonetic_matches`,
     `hyphen_matches`: item -> matched ASR span) so a later review can see
-    every such acceptance."""
+    every such acceptance. A single-token item that already passed via the
+    shared `_tok_eq` comparator's vowel-swap tolerance (a loanword
+    transliteration variant, e.g. "amir" -> "emir") is also noted in
+    `vowel_matches` for the same audit, even though it was never at risk of
+    hard-failing here."""
     items = []
     missing = []
     missing_fragile = []
     phonetic_matches = {}
     hyphen_matches = {}
+    vowel_matches = {}
     for item in mandatory:
         raw_phrase = item if isinstance(item, str) else " ".join(map(str, item))
         phrase = tokenize(raw_phrase)
@@ -819,6 +858,10 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
         label = item if isinstance(item, str) else " ".join(map(str, item))
         items.append(label)
         if _phrase_in(asr, phrase, ratio):
+            if len(phrase) == 1 and phrase[0].isalpha():
+                vmatch = _find_vowel_match(phrase[0], asr)
+                if vmatch:
+                    vowel_matches[label] = vmatch
             continue
         concat = _concat_match(phrase, asr)
         if concat:
@@ -835,7 +878,8 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
                 continue
         missing.append(label)
     return {"items": items, "missing": missing, "missing_fragile": missing_fragile,
-            "phonetic_matches": phonetic_matches, "hyphen_matches": hyphen_matches}
+            "phonetic_matches": phonetic_matches, "hyphen_matches": hyphen_matches,
+            "vowel_matches": vowel_matches}
 
 
 def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
@@ -1707,6 +1751,34 @@ def selfcheck() -> int:
     check("non-adjacent concatenation still rejected in coverage",
           _concat_reconcile(["waste", "utterly", "lands"], ["wastelands"])
           == ["waste", "utterly", "lands"])
+
+    # v22: a single vowel-for-vowel substitution (same length, both >= 4
+    # chars) is a loanword transliteration variant Whisper prefers
+    # ("amir" -> "emir"), not a genuine content difference -- the same
+    # vocabulary-snapping phenomenon as v12's phonetic matching, folded
+    # into the shared _tok_eq comparator so every gate that uses it
+    # (mandatory, terminal, alignment) inherits it consistently.
+    check("amir matches its transliteration variant emir",
+          _is_vowel_swap("amir", "emir"))
+    check("a consonant difference does not count as a vowel swap",
+          not _is_vowel_swap("amir", "abir"))
+    check("an insertion (length difference) does not count as a vowel swap",
+          not _is_vowel_swap("amir", "ameer"))
+    check("three-letter pairs are excluded regardless of vowel difference",
+          not _is_vowel_swap("cat", "cot"))
+    check("a genuinely different real-word pair stays unequal",
+          not _is_vowel_swap("amir", "world") and
+          not _tok_eq("amir", "world", MANDATORY_FUZZY_RATIO))
+    amir_terminal = terminal_suffix(
+        tokenize("they owed total loyalty to the amir or ruler."),
+        tokenize("they owed total loyalty to the emir or ruler."))
+    check("amir/emir passes the terminal-phrase gate",
+          amir_terminal["matched"], repr(amir_terminal))
+    amir_mandatory = check_mandatory(tokenize("the emir ruled wisely"), ["amir"])
+    check("amir/emir is recorded in vowel_matches for the morning audit",
+          amir_mandatory["missing"] == [] and
+          amir_mandatory["vowel_matches"] == {"amir": "emir"},
+          repr(amir_mandatory))
 
     check("terminal suffix present",
           terminal_suffix(tokenize("the history attempts to explain"),
