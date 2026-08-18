@@ -1,10 +1,12 @@
 # audiobook — make an audiobook from a book and a reference voice
 
 This tool turns an EPUB text file and a short voice sample into a spoken
-audiobook on an Apple Silicon Mac. It reads a book, speaks it one sentence at
-a time in a voice cloned from a reference recording, checks each sentence
-automatically, and resumes where it left off if you stop it. It does **not**
-edit the audio after it is generated — no loudness tweaks, no mastering.
+audiobook on an Apple Silicon Mac. It keeps each generation call inside one
+EPUB paragraph, groups complete sentences toward 70 words, and never exceeds
+85 words unless one sentence is longer. Each chunk is checked automatically,
+uses a deterministic seed with at most one alternate-seed retry, and resumes
+from stable chunk checkpoints after an interrupted run. It does **not** edit
+the generated audio: no loudness tweaks and no mastering.
 
 Everything about the book, the voice, and the model lives in one small file,
 `audiobook.toml`. You edit that file, then run a few commands.
@@ -80,8 +82,8 @@ the project root.
 | `[model] repo` | Which model to use (leave alone) | `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16` |
 | `[model] revision` | Exact model version (leave alone) | `a6eb4f…` |
 | `[model] language` | Language to speak | `English` |
-| `[model] max_tokens` | Max tokens per sentence | `4096` |
-| `[asr] repo` | Model used to check sentences (leave alone) | `mlx-community/whisper-large-v3-turbo` |
+| `[model] max_tokens` | Max generated audio tokens per chunk | `4096` |
+| `[asr] repo` | Model used to check paragraphs (leave alone) | `mlx-community/whisper-large-v3-turbo` |
 | `[asr] revision` | Exact ASR model version (leave alone) | `a4aae…` |
 
 To fill in the hashes:
@@ -109,8 +111,8 @@ uv run audiobook preflight
 
 This checks, in order: that the files exist, that their hashes match, that the
 model is cached, that the environment is right, and that the text extracts
-cleanly. It also does a short **measured pilot** generation so later timing
-estimates are real, not guesses.
+cleanly. It also runs a short **measured preflight pilot** so later timing
+estimates use measured values.
 
 If anything is wrong, it tells you exactly what (for example, a hash that does
 not match, or macOS older than 14).
@@ -121,8 +123,8 @@ not match, or macOS older than 14).
 uv run audiobook eta
 ```
 
-This reads the measured pilot and the number of sentences, then projects how
-long generation and checking will take on the machine running it. Run
+This reads the measured preflight pilot and sentence-chunk plan, then projects
+how long generation and checking will take on the machine running it. Run
 `preflight` on the M2 Pro first; its measured result is the only reliable ETA.
 
 ## Generate (and keep the Mac awake)
@@ -133,26 +135,28 @@ caffeinate -dimsu uv run audiobook generate
 
 `caffeinate` stops your Mac from sleeping during a long run.
 
-Generation is **checkpointed after every sentence**. If you stop it, or the
-Mac sleeps, or it crashes, the next `generate` picks up exactly where it
-stopped — you lose at most the one sentence it was working on. Chapters are
-assembled only after validation (below), not as you go.
+Generation is **checkpointed after every chunk**. If you stop it, or the Mac
+sleeps, or it crashes, the next `generate` picks up where it stopped. Chunk IDs
+contain the chapter, source paragraph, and sentence span. A failed generation
+gets at most one retry with a different deterministic seed. Chapters are
+assembled only after terminal validation passes for every chunk.
 
 Useful flags:
 
-- `--limit N` — generate only the first `N` sentences (a quick smoke test).
+- `--limit N` — generate only the first `N` chunks (a quick smoke test).
 - `--force` — ignore the saved progress and regenerate everything.
 - `--out DIR` — put output somewhere other than the default `outputs/qwen-book`.
 
-## Validate each sentence
+## Validate each chunk
 
 ```sh
 uv run audiobook validate
 ```
 
-Every generated sentence is checked by automated speech recognition. The
-strict validator keeps failed sentences for review and records why they
-failed. It assembles `book.wav` only when every planned sentence passes.
+Every generated chunk is checked by automated speech recognition. The strict
+validator keeps failed chunks for review and records why they failed. It
+assembles `book.wav` only when every planned chunk passes the terminal,
+structural, and ASR release gates.
 
 For this name-heavy book, Whisper can spell correct speech differently. Apply
 the recorded lexical policy after validation to distinguish those differences
@@ -164,7 +168,7 @@ uv run python -m audiobook.adjudicate --assemble
 ```
 
 The first command reports every decision without writing files. The second
-backs up failed sentence WAVs, appends every decision to the ledger, and writes
+backs up failed paragraph WAVs, appends every decision to the ledger, and writes
 `book.lexical-advisory-v1.wav`. It refuses assembly while any structural or
 low-coverage failure remains.
 
@@ -213,70 +217,56 @@ File map:
 
 - `config.py` reads `audiobook.toml`, finds the project root, and holds the
   settings.
-- `cli.py` provides the `preflight`, `eta`, `generate`, and `validate` commands.
-- `epub.py` extracts chapter text, normalizes it, and splits it into sentences.
-- `runner.py` generates sentence WAVs, saves atomic checkpoints, and records
-  progress. It also runs the measured pilot and calculates the ETA.
-- `asr.py` checks each sentence and writes strict PASS or FAIL records.
+- `epub.py` extracts and normalizes chapter text, then groups complete
+  sentences within each paragraph toward 70 words with an 85-word ceiling.
+- `runner.py` generates sentence-chunk WAVs, saves atomic checkpoints, and
+  records progress. It also runs the measured preflight pilot and calculates
+  the ETA.
+- `qwenfix.py` owns generation and decoding for the mlx-audio Qwen path.
+  It holds EOS for six extra frames so every take ends in its own natural
+  room tone (this restores the final word's release that the causal
+  decoder otherwise trims), decodes with exact trims (bypassing a
+  valid-length bug that chops 80 ms per zero-id codec token off the
+  tail), bounds and fades the silent tail, and computes two structural
+  gates: speech in the final 80 ms, and missing high-band energy when the
+  final word ends in a sibilant (a clipped "collapsed" has no /st/
+  energy). Failed takes are retried up to four times; retries are fresh
+  draws because MLX generation is not bit-reproducible across runs.
+- `asr.py` checks each chunk and writes strict PASS or FAIL records.
 - `adjudicate.py` records lexical overrides while retaining structural gates.
 - `package.py` writes the chaptered M4B from the current adjudication decisions.
 
 The rules it keeps:
 
 - **One model load** per run — loading is slow, so it loads once and reuses.
-- **Sentence-atomic checkpoints** — each sentence is its own saved file, so a
-  stop or crash loses at most the current sentence.
-- **Config fingerprint** — every run records the book/voice/model/asr hashes.
-  If any of them change (or the actual voice files change), old progress no
-  longer matches.
-- **Exact concatenation, no processing** — chapters are byte-joined from the
-  saved sentence WAVs; nothing is edited, normalized, or mastered.
+- **Chunk-atomic checkpoints** — each chunk is one saved file, so a stop or
+  crash loses at most the current chunk.
+- **Stable chunk resume** — chapter, paragraph and sentence-span IDs, exact
+  text hashes, and the input/model/ASR fingerprint must match. Changing them
+  invalidates old resume state; use `--force` or a fresh `--out`.
+- **Direct concatenation** — chunks retain Qwen's natural boundary silence.
+  No overlap, crossfade, inserted silence, mastering, or other processing.
 
 Where to change what:
 
 - New book or voice / hashes → `audiobook.toml`.
-- Text cleanup (numbers, punctuation, sentence splitting) → `epub.py`.
+- Text cleanup (numbers, punctuation, paragraph extraction) → `epub.py`.
 - Sound of generation / checkpoints → `runner.py`.
-- How sentences are verified → `asr.py`.
-- Lexical override policy and assembly → `adjudicate.py`.
+- How chunks are verified → `asr.py`.
 - M4B metadata, cover, and chapter packaging → `package.py`.
 - New or changed commands / flags → `cli.py`.
 
 Keep those invariants in mind when you edit: changing inputs or generation
-details must change the fingerprint, and never post-process the saved
-sentence audio.
-
-## Performance experiments (benchmark-only, nothing enabled)
-
-`audiobook/perf.py` is an opt-in benchmark/profiling harness that compares the
-frozen sequential generation against two *unadopted* speedups. **Neither is
-enabled in production** — they only run here, in isolated fresh subprocesses,
-writing under `outputs/perf` (gitignored):
-
-- **speaker-cache** (default): caches the canonical reference speaker
-  embedding instead of re-extracting it every sentence.
-- **batch2 / batch4**: Qwen `batch_generate` with a shared reference. This is
-  **output-changing** (it forces `repetition_penalty >= 1.5` and a per-seq
-  max-token cap) and only runs with `--accept-output-changing`.
-
-```sh
-uv run python -m audiobook.perf profile          # measure phase timings
-uv run python -m audiobook.perf benchmark        # baseline vs speaker-cache
-uv run python -m audiobook.perf benchmark --include-batch --accept-output-changing
-```
-
-Qwen has no seed, so percentages are indicative only; objective structure and
-persistent-ASR gates plus blind human A/B samples are required before any
-adoption. This tool never touches production state, output, or generation
-defaults.
+details must change the fingerprint, and never post-process the saved chunk
+audio.
 
 ## Commands at a glance
 
 ```sh
 uv run audiobook preflight                         # check inputs and measure the pilot
-uv run audiobook eta                               # project time from the measured pilot
-uv run audiobook generate                          # generate resumable sentence WAVs
-uv run audiobook validate                          # record strict ASR decisions
+uv run audiobook eta                               # project time from the measured pilot and chunk plan
+uv run audiobook generate                          # generate resumable sentence-chunk WAVs
+uv run audiobook validate                          # record strict ASR decisions for chunks
 uv run python -m audiobook.adjudicate --assemble   # record overrides and assemble the WAV
 uv run python -m audiobook.package                 # write the chaptered M4B
 ```

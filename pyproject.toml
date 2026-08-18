@@ -1,7 +1,7 @@
 [project]
 name = "audiobook"
 version = "0.1.0"
-description = "Private Qwen3-TTS + Bragg-reference audiobook generation (Apple Silicon MLX). Frozen behavior: pinned model/deps, non-stream sentence generation, PCM16 checkpoints, no mastering."
+description = "Private Qwen3-TTS + Bragg-reference audiobook generation on Apple Silicon MLX, using paragraph-bounded sentence chunks with deterministic retries, terminal validation, and byte-exact PCM16 assembly; no mastering."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
