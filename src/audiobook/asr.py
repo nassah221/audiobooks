@@ -55,6 +55,8 @@ import sys
 import time
 from collections import Counter
 
+from . import epub
+
 # --- frozen ASR model (default) ---------------------------------------------
 # whisper-large-v3-turbo (weights.safetensors layout): loadable by pinned
 # mlx-whisper 0.4.3. Proper-noun coverage is the deciding factor: whisper-tiny
@@ -63,7 +65,7 @@ from collections import Counter
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v9-decade-ellipsis"
+VALIDATION_POLICY = "paragraph-v10-abbreviations"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -294,6 +296,22 @@ def normalized_word_timings(segments: list) -> list:
     return out
 
 
+_INITIALS_RE = re.compile(r"(?:[A-Z]\.)+")
+
+
+def _is_sentence_abbreviation(word: str) -> bool:
+    """True when `word` (the text up to and including a "." candidate) is a
+    known abbreviation ("i.e.", "e.g.", ...) or an initials run ("U.S."),
+    not a genuine sentence end. Reuses epub.sentence_spans's own
+    abbreviation set (`epub._ABBREVIATIONS`) and initials pattern -- the
+    planner's sentence splitter and this ASR boundary scanner must agree on
+    what counts as a sentence, or the scanner flags a pause the source text
+    never asked for (e.g. inside "(i.e." there is no sentence break, so
+    requiring one fails the take by construction)."""
+    stripped = word.lstrip("([{\"'‘“")
+    return stripped.lower() in epub._ABBREVIATIONS or bool(_INITIALS_RE.fullmatch(stripped))
+
+
 def _source_punctuation_boundaries(source: str) -> list:
     """Find punctuation boundaries and their preceding normalized token.
 
@@ -303,6 +321,12 @@ def _source_punctuation_boundaries(source: str) -> list:
     sentence -- an enumerated-list marker like "one." -- is read with a
     shorter pause than ordinary prose, so `punctuation_metrics` relaxes its
     threshold when this count is low (see SHORT_SENTENCE_MAX_WORDS).
+
+    A "." only starts a `sentence_end` candidate when it ends its
+    whitespace-delimited token (mirroring epub.sentence_spans's `(?=\\s|$)`
+    lookahead) and that token is not a known abbreviation -- otherwise an
+    abbreviation like "i.e." would spuriously split into two boundaries at
+    its own internal periods.
     """
     boundaries = []
     prev_sentence_end_index = -1
@@ -320,6 +344,10 @@ def _source_punctuation_boundaries(source: str) -> list:
             if mark[0] == ".":
                 pos = punctuation.start()
                 if pos and pos + 1 < len(chunk) and chunk[pos - 1].isdigit() and chunk[pos + 1].isdigit():
+                    continue
+                if punctuation.end() != len(chunk):
+                    continue  # not sentence-final in this token (e.g. "i." inside "i.e.")
+                if _is_sentence_abbreviation(chunk[:punctuation.end()]):
                     continue
                 kind = "sentence_end"
             elif mark[0] in ":;":
@@ -1222,6 +1250,31 @@ def selfcheck() -> int:
           sentence_boundaries[1]["sentence_word_count"] > SHORT_SENTENCE_MAX_WORDS and
           sentence_boundaries[1]["threshold_s"] == PUNCTUATION_THRESHOLDS["sentence_end"],
           repr(sentence_boundaries[1]))
+
+    # An abbreviation like "i.e." must not spawn a false sentence_end at its
+    # own internal period -- the planner's sentence splitter (epub.py) never
+    # treats it as a sentence break, so the ASR boundary scanner must agree
+    # (see epub._ABBREVIATIONS, the shared source of truth).
+    abbrev_source = ("This is modernization (i.e. the replication of "
+                      "structure). Both attitudes had it.")
+    abbrev_boundaries = [b for b in _source_punctuation_boundaries(abbrev_source)
+                         if b["kind"] == "sentence_end"]
+    check("abbreviation period produces no sentence_end boundary",
+          len(abbrev_boundaries) == 2, repr(abbrev_boundaries))
+    abbrev_tokens = tokenize(abbrev_source)
+    check("abbreviation is not among the sentence_end boundary words",
+          all(abbrev_tokens[b["expected_token_index"]] not in ("i", "e")
+              for b in abbrev_boundaries),
+          repr([abbrev_tokens[b["expected_token_index"]] for b in abbrev_boundaries]))
+    check("a real sentence end after an ordinary word still boundaries",
+          abbrev_tokens[abbrev_boundaries[0]["expected_token_index"]] == "structure" and
+          abbrev_tokens[abbrev_boundaries[1]["expected_token_index"]] == "it",
+          repr([abbrev_tokens[b["expected_token_index"]] for b in abbrev_boundaries]))
+    initials_source = "He worked for the U.S. government."
+    initials_boundaries = [b for b in _source_punctuation_boundaries(initials_source)
+                           if b["kind"] == "sentence_end"]
+    check("initials abbreviation (U.S.) produces exactly one real sentence end",
+          len(initials_boundaries) == 1, repr(initials_boundaries))
 
     short_words = words[:2] + words[3:]
     diagnostic = punctuation_metrics(source, short_words)
