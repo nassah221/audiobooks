@@ -61,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("eta", help="projected generation + ASR cost from the measured preflight pilot")
 
+    p = sub.add_parser("regenerate", help="move selected done chunks back to pending for "
+                                          "a fresh take (archives old wavs, clears validation cache)")
+    p.add_argument("--chunks", required=True,
+                   help="path to a file with one chunk id per line (blank lines ignored)")
+
     return ap
 
 
@@ -114,6 +119,15 @@ def _print_validate(rpt: dict) -> None:
             print(f"    {cid}")
 
 
+def _print_regenerate(rpt: dict) -> None:
+    print(f"audiobook regenerate: {len(rpt['regenerated'])} chunk(s) moved to pending "
+          f"({len(rpt['archived_wavs'])} wav(s) archived, "
+          f"{rpt['cleared_records']} validation record(s) cleared, "
+          f"{rpt['cleared_cache_entries']} ASR-cache entry(ies) cleared)")
+    for cid in rpt["regenerated"]:
+        print(f"  {cid}")
+
+
 def _print_eta(rpt: dict) -> None:
     print("audiobook eta")
     print(f"  plan: {rpt['chapters']} chapters, {rpt['paragraphs']} paragraphs, {rpt['words']} words")
@@ -158,6 +172,14 @@ def main(argv=None) -> int:
                 root, out, chapters=args.chapters, limit=args.limit))
         elif args.cmd == "eta":
             _print_eta(runner.estimate(root, out))
+        elif args.cmd == "regenerate":
+            chunks_path = pathlib.Path(args.chunks)
+            if not chunks_path.is_file():
+                raise RunError(f"--chunks {chunks_path}: no such file")
+            ids = [line.strip() for line in chunks_path.read_text().splitlines() if line.strip()]
+            if not ids:
+                raise RunError(f"--chunks {chunks_path}: no chunk ids found")
+            _print_regenerate(runner.regenerate(root, out, ids))
         return 0
     except RunError as e:
         print(f"error: {e}", file=sys.stderr)

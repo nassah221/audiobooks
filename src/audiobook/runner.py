@@ -46,6 +46,7 @@ __all__ = [
     "preflight",
     "Generator",
     "validate_generated",
+    "regenerate",
     "estimate",
     "selfcheck",
 ]
@@ -1874,6 +1875,109 @@ def validate_generated(root, out_dir, *, chapters=None, limit=None, config=None)
     return result
 
 
+# --- selective regeneration ---------------------------------------------------
+def regenerate(root, out_dir, chunk_ids, *, config=None) -> dict:
+    """Move the listed DONE chunks back to pending (concern D).
+
+    For each chunk id: pop it from `state.json`'s `done` map, rename its
+    existing wav aside (``<name>.superseded-<timestamp>.wav`` -- archived,
+    never deleted, matching the rest of this module's "never destroy a
+    generated take" policy), and clear its `validation/records.json` and
+    `validation/asr-cache.json` entries so the next `generate` re-runs it
+    fresh under whatever policy/gates are current, with no rolling context
+    (the codec frames that would carry it were never persisted). An id not
+    currently in `done` is a hard error -- silently skipping a typo would
+    leave the caller believing a chunk was queued for regeneration when it
+    was not.
+
+    `root`/`config` are accepted for interface symmetry with the rest of
+    this module (a future version may want to validate ids against a
+    freshly-built plan); regenerate itself only touches `out_dir` and does
+    not require the book, model, or ASR model.
+    """
+    out_dir = pathlib.Path(out_dir)
+    state_path = out_dir / STATE_REL
+    if not state_path.is_file():
+        raise RunError(f"no generation state at {state_path}; nothing to regenerate")
+    st = json.loads(state_path.read_text())
+    done = st.get("done", {}) or {}
+    failed = st.get("failed", {}) or {}
+    ids = list(dict.fromkeys(chunk_ids))  # de-dupe, preserve request order
+    if not ids:
+        raise RunError("regenerate: no chunk ids given")
+    unknown = [cid for cid in ids if cid not in done]
+    if unknown:
+        detail = ", ".join(
+            f"{cid} (in the failed set, not done)" if cid in failed else cid
+            for cid in unknown
+        )
+        raise RunError(
+            "regenerate: chunk id(s) not in the done set (typo, already pending, "
+            f"or already failed): {detail}"
+        )
+
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    archived_wavs = []
+    for cid in ids:
+        entry = done.pop(cid)
+        wav_rel = entry.get("wav")
+        if not wav_rel:
+            continue  # an omitted unit has no wav to archive
+        wav_path = out_dir / wav_rel
+        if not wav_path.is_file():
+            continue  # nothing on disk to preserve; state alone is enough
+        superseded = wav_path.with_name(f"{wav_path.name}.superseded-{timestamp}.wav")
+        n = 1
+        while superseded.exists():
+            superseded = wav_path.with_name(
+                f"{wav_path.name}.superseded-{timestamp}-{n}.wav")
+            n += 1
+        os.replace(wav_path, superseded)
+        archived_wavs.append(str(superseded.relative_to(out_dir)))
+    st["done"] = done
+    _atomic_write_json(state_path, st)
+
+    id_set = set(ids)
+    cleared_records = 0
+    records_path = out_dir / RECORDS_REL
+    if records_path.is_file():
+        try:
+            payload = json.loads(records_path.read_text())
+            records = {r["chunk_id"]: r for r in payload.get("records", [])
+                       if isinstance(r, dict) and r.get("chunk_id")}
+            asr_header = payload.get("asr", {})
+        except (json.JSONDecodeError, KeyError, TypeError):
+            records, asr_header = {}, {}
+        cleared_records = sum(1 for cid in ids if records.pop(cid, None) is not None)
+        if cleared_records:
+            _atomic_write_json(records_path, {
+                "asr": asr_header,
+                "records": sorted(records.values(), key=lambda r: r.get("chunk_id") or ""),
+            })
+
+    cleared_cache = 0
+    cache_path = out_dir / ASR_CACHE_REL
+    if cache_path.is_file():
+        try:
+            cache = json.loads(cache_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+        stale_keys = [k for k, v in cache.items()
+                      if isinstance(v, dict) and v.get("chunk_id") in id_set]
+        for k in stale_keys:
+            del cache[k]
+        cleared_cache = len(stale_keys)
+        if stale_keys:
+            _atomic_write_json(cache_path, cache)
+
+    return {
+        "regenerated": ids,
+        "archived_wavs": archived_wavs,
+        "cleared_records": cleared_records,
+        "cleared_cache_entries": cleared_cache,
+    }
+
+
 # --- eta ---------------------------------------------------------------------
 def estimate(root, out_dir, config=None, plan=None) -> dict:
     """Project generation and ASR wall time from the measured pilot and the
@@ -3014,6 +3118,65 @@ def selfcheck() -> int:
         discard_gen._load_state()
         check("--discard-done explicitly zeroes done after archiving (never silent)",
               discard_gen.done == {} and (force_gen.out_dir / "state.json.bak-2").is_file())
+
+    # --- concern D: selective regeneration ----------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        wav_a = td / "chunks" / "ch01" / (_ca["id"].replace(":", "-") + ".wav")
+        wav_b = td / "chunks" / "ch01" / (_cb["id"].replace(":", "-") + ".wav")
+        wav_a.parent.mkdir(parents=True, exist_ok=True)
+        _make_wav(wav_a, [1, 2, 3])
+        _make_wav(wav_b, [4, 5, 6])
+        done0 = {
+            _ca["id"]: {"text_sha256": _ca["text_sha256"], "wav": str(wav_a.relative_to(td)),
+                       "wav_sha256": sha256_file(wav_a), "samples": 3, "seconds": 0.1,
+                       "terminal_silence_seconds": 0.0, "generation_policy": "icl-rolling-v1"},
+            _cb["id"]: {"text_sha256": _cb["text_sha256"], "wav": str(wav_b.relative_to(td)),
+                       "wav_sha256": sha256_file(wav_b), "samples": 3, "seconds": 0.1,
+                       "terminal_silence_seconds": 0.0, "generation_policy": "icl-rolling-v1"},
+        }
+        _atomic_write_json(td / STATE_REL, {
+            "fingerprint": "fp-regen", "plan": st_plan, "done": dict(done0),
+            "failed": {}, "started_unix": 0.0,
+        })
+        _atomic_write_json(td / RECORDS_REL, {
+            "asr": {"model_repo": "a", "model_revision": "b"},
+            "records": [{"chunk_id": _ca["id"], "verdict": "PASS"},
+                        {"chunk_id": _cb["id"], "verdict": "PASS"}],
+        })
+        _atomic_write_json(td / ASR_CACHE_REL, {
+            "key-a": {"chunk_id": _ca["id"], "verdict": "PASS"},
+            "key-b": {"chunk_id": _cb["id"], "verdict": "PASS"},
+        })
+
+        result = regenerate(str(td), str(td), [_ca["id"]])
+        new_state = json.loads((td / STATE_REL).read_text())
+        new_records = json.loads((td / RECORDS_REL).read_text())["records"]
+        new_cache = json.loads((td / ASR_CACHE_REL).read_text())
+        check("regenerate moves exactly the listed chunk out of done, leaves the other",
+              _ca["id"] not in new_state["done"] and _cb["id"] in new_state["done"])
+        check("regenerate archives the wav (renamed, not deleted) and leaves the other's alone",
+              not wav_a.is_file() and wav_b.is_file()
+              and len(result["archived_wavs"]) == 1
+              and (td / result["archived_wavs"][0]).is_file()
+              and ".superseded-" in result["archived_wavs"][0])
+        check("regenerate clears only the regenerated chunk's validation record",
+              {r["chunk_id"] for r in new_records} == {_cb["id"]})
+        check("regenerate clears only the regenerated chunk's ASR-cache entry",
+              set(new_cache) == {"key-b"})
+        check("regenerate rejects an id that is not in the done set",
+              _raises(RunError, regenerate, str(td), str(td), ["no-such-chunk"]))
+
+        # Survives a subsequent resume: state.json's "plan" field is
+        # untouched by regenerate, so a fresh Generator._load_state()
+        # against the SAME plan sees a "match" relation and loads the
+        # trimmed done set -- the regenerated chunk is pending, the
+        # untouched one is still done.
+        resume_gen = _make_state_gen(str(td), cur_plan, fingerprint="fp-regen")
+        resume_gen._load_state()
+        check("regenerate's result survives a subsequent resume (match, not conflict)",
+              _ca["id"] not in resume_gen.done and _cb["id"] in resume_gen.done
+              and resume_gen.done[_cb["id"]]["wav_sha256"] == done0[_cb["id"]]["wav_sha256"])
 
     failed = [name for name, ok in results if not ok]
     print(f"selfcheck: {len(results) - len(failed)}/{len(results)} passed")
