@@ -61,6 +61,20 @@ PILOT_SENTENCE = (
 # Each paragraph attempt resets that RNG to a stable, distinct seed.
 CLAUSE_SPLIT_POLICY = "planned-strong-clause-v1"
 
+# Generation policy identifier, recorded on each `done`/`failed` entry (see
+# `_generate`/`_record_chunk`) -- NOT hashed into run_fingerprint. Bumping
+# this string documents a change in generation behavior (EOS-hold tail
+# handling, the context-drift gate, ...) without invalidating a directory's
+# resume state: run_fingerprint only gates the inputs that make existing
+# audio flatly wrong (model, reference voice, book, seed base), so an old
+# directory generated under an earlier policy stays resumable under newer
+# code. A directory legally mixes policies across chunks -- old chunks keep
+# the policy they were generated under; only newly generated chunks record
+# the current one. Audit which policy produced a given chunk by reading its
+# `done[chunk_id]["generation_policy"]` (absent on chunks generated before
+# this field existed).
+GENERATION_POLICY = "icl-rolling-v2"
+
 # Shared predicate for "this unit has nothing to pronounce" (a stray
 # formatting artifact like a bare "*" section-break marker). Single source
 # of truth for both the live generation skip below and adjudicate.py's
@@ -234,35 +248,33 @@ def _atomic_write_json(path: pathlib.Path, obj) -> None:
     _atomic_write(path, json.dumps(obj, indent=1) + "\n")
 
 def run_fingerprint(cfg: Config, ref_wav_sha: str, ref_text_sha: str) -> str:
-    """Hash inputs, generation settings, and the exact chunk policy."""
-    planner = {"policy": epub.SENTENCE_GROUP_POLICY,
-               "version": epub.SENTENCE_GROUP_VERSION,
-               "limits": dict(epub.SENTENCE_GROUP_LIMITS),
-               "clause_policy": CLAUSE_SPLIT_POLICY}
+    """Hash only the immutable inputs that make existing audio flatly wrong
+    if they change: which model produced it, which voice it was cloned
+    from (the reference WAV and its exact transcript, always used as a
+    pair), which book it was read from, and the base seed.
+
+    Everything that used to live here -- the sentence/clause planner
+    version, the ASR validator, and the generation policy (EOS-hold tail
+    handling, structural gates, the context-drift gate) -- is deliberately
+    left out:
+
+    - Planner changes are already caught per chunk by
+      ``_chunk_identity_hash``/``_state_plan_matches`` (a changed sentence
+      or clause boundary changes that chunk's identity hash, which blocks
+      *that* chunk, not the whole run).
+    - The ASR validator's repo/revision is already checked per validation
+      record by ``_record_ok``, independent of run identity.
+    - The generation policy moved to a per-chunk ``done`` field (see
+      ``GENERATION_POLICY``) instead of a run-wide gate, so a code upgrade
+      that only changes generation behavior never invalidates a
+      directory's whole resume state -- a directory legally mixes
+      policies across chunks as new code lands.
+    """
     payload = {
-        "book": {"path": cfg.book, "sha256": cfg.book_sha256},
-        "voice": {"audio": cfg.audio, "wav_sha256": ref_wav_sha,
-                  "transcript": cfg.transcript, "text_sha256": ref_text_sha},
-        "model": {"repo": cfg.model_repo, "revision": cfg.model_revision,
-                  "language": cfg.language, "max_tokens": cfg.max_tokens,
-                  "seed": cfg.seed},
-        "asr": {"repo": cfg.asr_repo, "revision": cfg.asr_revision},
-        "planner": planner, "sample_rate": SAMPLE_RATE, "stream": False,
-        "generation": {"policy": "icl-rolling-v2",
-                       "eos_hold_frames": qwenfix.EOS_HOLD_FRAMES,
-                       "tail_max_silence_seconds": qwenfix.TAIL_MAX_SILENCE_SECONDS,
-                       "tail_fade_seconds": qwenfix.TAIL_FADE_SECONDS,
-                       "sibilant_high_frac_min": qwenfix.SIBILANT_HIGH_FRAC_MIN,
-                       "context_window_units": 1,
-                       "context_scope": "paragraph",
-                       "context_on_retry": False,
-                       # Context-drift gate (v2): a take's codes are usable
-                       # as context for the next chunk only above this
-                       # high-band energy floor, and never past this chain
-                       # depth regardless of quality -- see
-                       # qwenfix.speech_high_band_frac / _context_decision.
-                       "context_drift_high_frac_min": qwenfix.CONTEXT_DRIFT_HIGH_FRAC_MIN,
-                       "context_chain_depth_max": qwenfix.CONTEXT_CHAIN_DEPTH_MAX},
+        "model": {"repo": cfg.model_repo, "revision": cfg.model_revision},
+        "reference": {"wav_sha256": ref_wav_sha, "text_sha256": ref_text_sha},
+        "book": {"sha256": cfg.book_sha256},
+        "seed": cfg.seed,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -968,6 +980,11 @@ class Generator:
                 "terminal_silence_seconds": record["terminal_silence_seconds"],
                 "tail_frame_peak": record.get("tail_frame_peak", 0.0),
                 "context_chunk_id": record.get("context_chunk_id"),
+                # Audit trail for concern A: which generation policy
+                # produced this take. Absent on chunks generated before
+                # this field existed -- that is the "mixed-policy
+                # directory" the fingerprint split makes legal.
+                "generation_policy": record.get("generation_policy"),
                 # Context-drift gate (icl-rolling-v2) audit trail: measured
                 # high-band fraction, chain depth, and whether this take's
                 # codes were usable as context for the next chunk -- kept
@@ -1268,6 +1285,12 @@ class Generator:
             "reference_text_sha256": self.ref_text_sha,
             "seed": seed, "attempt": attempt, "started_unix": time.time(),
             "context_chunk_id": context["chunk_id"] if context is not None else None,
+            # Per-chunk generation policy (concern A) -- NOT in
+            # run_fingerprint, so bumping GENERATION_POLICY never
+            # invalidates an existing directory's resume state; a
+            # directory legally mixes policies as chunks generated under
+            # different code land side by side.
+            "generation_policy": GENERATION_POLICY,
             # Internal only: the generated codec frames, kept for a possible
             # rolling-context handoff to the next chunk. Never persisted —
             # excluded from state.json/records.json by the explicit field
@@ -1850,29 +1873,46 @@ def selfcheck() -> int:
     fp3 = run_fingerprint(_base, "w", "t2")
     check("fingerprint deterministic", fp1 == fp2)
     check("fingerprint sensitive to reference", fp1 != fp3)
-    check("fingerprint sensitive to max_tokens",
-          fp1 != run_fingerprint(Config(_root, "b.epub", "1" * 64, "v.wav", "2" * 64, "v.txt", "3" * 64,
-                                        "repo", "rev", "English", 8192, 42, "a-repo", "a-rev"),
-                                 "w", "t"))
     check("fingerprint sensitive to seed",
           fp1 != run_fingerprint(Config(_root, "b.epub", "1" * 64, "v.wav", "2" * 64, "v.txt", "3" * 64,
                                         "repo", "rev", "English", 4096, 43, "a-repo", "a-rev"),
                                  "w", "t"))
-    check("fingerprint sensitive to model",
+    check("fingerprint sensitive to model repo",
           fp1 != run_fingerprint(Config(_root, "b.epub", "1" * 64, "v.wav", "2" * 64, "v.txt", "3" * 64,
                                         "repo2", "rev", "English", 4096, 42, "a-repo", "a-rev"),
                                  "w", "t"))
-    check("fingerprint sensitive to asr",
+    check("fingerprint sensitive to model revision",
           fp1 != run_fingerprint(Config(_root, "b.epub", "1" * 64, "v.wav", "2" * 64, "v.txt", "3" * 64,
-                                        "repo", "rev", "English", 4096, 42, "a-repo2", "a-rev"),
+                                        "repo", "rev2", "English", 4096, 42, "a-repo", "a-rev"),
                                  "w", "t"))
     check("fingerprint sensitive to book hash",
           fp1 != run_fingerprint(Config(_root, "b.epub", "2" * 64, "v.wav", "2" * 64, "v.txt", "3" * 64,
                                         "repo", "rev", "English", 4096, 42, "a-repo", "a-rev"),
                                  "w", "t"))
-    check("fingerprint sensitive to voice path",
-          fp1 != run_fingerprint(Config(_root, "b.epub", "1" * 64, "other.wav", "2" * 64, "v.txt", "3" * 64,
-                                        "repo", "rev", "English", 4096, 42, "a-repo", "a-rev"),
+    # Concern A: run_fingerprint now gates ONLY the inputs that make
+    # existing audio flatly wrong -- model, reference (wav+transcript
+    # hash), book, seed. max_tokens, the ASR validator, language, and bare
+    # path strings (as opposed to their content hashes) moved out: a
+    # directory generated under an earlier ASR model, token limit, or
+    # generation policy must keep resuming under current code (a
+    # "mixed-policy directory" -- see GENERATION_POLICY and the plan
+    # widening/mixed-policy checks below), not get refused outright.
+    check("fingerprint NOT sensitive to max_tokens (moved out of run identity)",
+          fp1 == run_fingerprint(Config(_root, "b.epub", "1" * 64, "v.wav", "2" * 64, "v.txt", "3" * 64,
+                                        "repo", "rev", "English", 8192, 42, "a-repo", "a-rev"),
+                                 "w", "t"))
+    check("fingerprint NOT sensitive to the ASR validator (checked per validation record instead)",
+          fp1 == run_fingerprint(Config(_root, "b.epub", "1" * 64, "v.wav", "2" * 64, "v.txt", "3" * 64,
+                                        "repo", "rev", "English", 4096, 42, "a-repo2", "a-rev2"),
+                                 "w", "t"))
+    check("fingerprint NOT sensitive to language",
+          fp1 == run_fingerprint(Config(_root, "b.epub", "1" * 64, "v.wav", "2" * 64, "v.txt", "3" * 64,
+                                        "repo", "rev", "French", 4096, 42, "a-repo", "a-rev"),
+                                 "w", "t"))
+    check("fingerprint NOT sensitive to bare path strings (only content hashes count)",
+          fp1 == run_fingerprint(Config(_root, "other.epub", "1" * 64, "other.wav", "2" * 64,
+                                        "other.txt", "3" * 64, "repo", "rev", "English",
+                                        4096, 42, "a-repo", "a-rev"),
                                  "w", "t"))
 
     # config validation (no model, no book)
@@ -2544,43 +2584,54 @@ def selfcheck() -> int:
           and record_gen.done[rec_low["id"]]["context_depth"] == 0
           and record_gen.done[rec_low["id"]]["context_usable"] is False)
 
-    # Fingerprint: bumping the generation policy string must produce a
-    # DIFFERENT fingerprint, so a v2 binary refuses (never silently
-    # touches) an existing v1 state.json -- the same mismatch guard
-    # _load_state already enforces, no new code needed for this part.
-    # Reconstruct the exact pre-drift-gate ("icl-rolling-v1") payload shape
-    # and confirm the current run_fingerprint output differs from it -- the
-    # concrete proof that a v1 state.json's stored fingerprint no longer
-    # matches, so _load_state's existing mismatch guard (unchanged by this
-    # feature) refuses it rather than silently reinterpreting it. v1 dirs
-    # (chapter 1, chapter 2) are simply never touched by v2 code as a
-    # result -- no special-case code needed for that.
-    _v1_style_payload = {
-        "book": {"path": _base.book, "sha256": _base.book_sha256},
-        "voice": {"audio": _base.audio, "wav_sha256": "w",
-                  "transcript": _base.transcript, "text_sha256": "t"},
-        "model": {"repo": _base.model_repo, "revision": _base.model_revision,
-                  "language": _base.language, "max_tokens": _base.max_tokens,
-                  "seed": _base.seed},
-        "asr": {"repo": _base.asr_repo, "revision": _base.asr_revision},
-        "planner": {"policy": epub.SENTENCE_GROUP_POLICY,
-                    "version": epub.SENTENCE_GROUP_VERSION,
-                    "limits": dict(epub.SENTENCE_GROUP_LIMITS),
-                    "clause_policy": CLAUSE_SPLIT_POLICY},
-        "sample_rate": SAMPLE_RATE, "stream": False,
-        "generation": {"policy": "icl-rolling-v1",
-                       "eos_hold_frames": qwenfix.EOS_HOLD_FRAMES,
-                       "tail_max_silence_seconds": qwenfix.TAIL_MAX_SILENCE_SECONDS,
-                       "tail_fade_seconds": qwenfix.TAIL_FADE_SECONDS,
-                       "sibilant_high_frac_min": qwenfix.SIBILANT_HIGH_FRAC_MIN,
-                       "context_window_units": 1, "context_scope": "paragraph",
-                       "context_on_retry": False},
-    }
-    _v1_style_fp = hashlib.sha256(
-        json.dumps(_v1_style_payload, sort_keys=True).encode()).hexdigest()
-    check("icl-rolling-v2 changes the fingerprint vs. the old v1 payload shape "
-          "(a v1 state.json is refused, not silently reinterpreted)",
-          _v1_style_fp != fp1)
+    # Concern A: the generation policy lives on each `done` entry (see
+    # GENERATION_POLICY / `_generate` / `_record_chunk`), not in
+    # run_fingerprint, so bumping it never invalidates an existing
+    # directory's resume state -- a directory legally mixes policies
+    # across chunks as new code lands (a "mixed-policy directory").
+    policy_gen = object.__new__(Generator)
+    policy_gen.done = {}
+    policy_gen._records = {}
+    policy_gen._save_records = lambda: None
+    policy_gen._save_state = lambda: None
+    policy_gen._rolling = None
+    new_take = {"id": "ch01:p0200:s0000-0001", "text_sha256": "h1", "wav": "w1.wav",
+                "wav_sha256": "ws1", "samples": 10, "seconds": 0.1,
+                "terminal_silence_seconds": 0.0, "paragraph_index": 200, "chapter": "ch01",
+                "generation_policy": GENERATION_POLICY}
+    policy_gen._record_chunk(new_take)
+    check("a freshly generated chunk records the current generation policy",
+          policy_gen.done[new_take["id"]]["generation_policy"] == GENERATION_POLICY)
+
+    # A chunk generated before this field existed (a real done entry from
+    # outputs/qwen-book-v2, generated under "icl-rolling-v1") has no
+    # "generation_policy" key at all. It must load and behave exactly as
+    # before: _unit_done only cares about text_sha256 and the wav's own
+    # sha256, never the policy string, so a directory mixing such entries
+    # with freshly-generated ones (current policy) is unremarkable.
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        v1_wav = td / "v1.wav"
+        _make_wav(v1_wav, [1, 2, 3])
+        mixed_gen = object.__new__(Generator)
+        mixed_gen.out_dir = td
+        mixed_gen.validate = False
+        v1_chunk = {"id": "ch01:p0000:s0000-0001", "text_sha256": "h-v1"}
+        v2_chunk = {"id": "ch01:p0001:s0000-0001", "text_sha256": "h-v2"}
+        mixed_gen.done = {
+            v1_chunk["id"]: {"text_sha256": "h-v1", "wav": v1_wav.name,
+                             "wav_sha256": sha256_file(v1_wav), "samples": 3,
+                             "terminal_silence_seconds": 0.0},  # no generation_policy key
+            v2_chunk["id"]: {"text_sha256": "h-v2", "wav": v1_wav.name,
+                             "wav_sha256": sha256_file(v1_wav), "samples": 3,
+                             "terminal_silence_seconds": 0.0,
+                             "generation_policy": GENERATION_POLICY},
+        }
+        check("a mixed-policy directory (a v1 entry with no policy key next to a "
+              "v2 entry with the current policy) loads and validates both chunks cleanly",
+              mixed_gen._unit_done(v1_chunk) and mixed_gen._unit_done(v2_chunk)
+              and "generation_policy" not in mixed_gen.done[v1_chunk["id"]]
+              and mixed_gen.done[v2_chunk["id"]]["generation_policy"] == GENERATION_POLICY)
 
     # v31 plan-identity trap: normalize_for_tts must never reach chunk id,
     # text_sha256, or anything build_plan/_child_chunks hash -- those stay
