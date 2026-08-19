@@ -74,7 +74,27 @@ CLAUSE_SPLIT_POLICY = "planned-strong-clause-v1"
 # the current one. Audit which policy produced a given chunk by reading its
 # `done[chunk_id]["generation_policy"]` (absent on chunks generated before
 # this field existed).
-GENERATION_POLICY = "icl-rolling-v2"
+#
+# Lineage: v1 (icl-rolling-v1) conditioned every mid-paragraph chunk on the
+# previous chunk's text+codes unconditionally. v2 (icl-rolling-v2) added the
+# context-drift gate (CONTEXT_DRIFT_HIGH_FRAC_MIN / CONTEXT_CHAIN_DEPTH_MAX
+# below) to stop reusing codes once they measured too muffled. Hassan
+# listened to v2 output and still heard audible timbre drift within a
+# chain, so v3 (icl-nocontext-v3) turns rolling context off entirely via
+# ROLLING_CONTEXT_ENABLED: every chunk generates from the Bragg reference
+# alone, the same context-free path a paragraph-start chunk always used.
+# The v1/v2 machinery (_rolling_context_for, _context_decision,
+# _accept_rolling, qwenfix's context-splicing) stays in the code, gated
+# off, in case a future fix makes rolling context viable again.
+GENERATION_POLICY = "icl-nocontext-v3"
+
+# Master switch for rolling-context conditioning (see GENERATION_POLICY
+# lineage above). False: every chunk's generation call gets context=None,
+# and per-chunk context fields (context_chunk_id/context_depth/
+# context_usable) record as None -- only the spectral field
+# (context_high_frac, cheap and useful for audits regardless) still
+# records normally. True restores the icl-rolling-v2 behavior unchanged.
+ROLLING_CONTEXT_ENABLED = False
 
 # Shared predicate for "this unit has nothing to pronounce" (a stray
 # formatting artifact like a bare "*" section-break marker). Single source
@@ -1158,12 +1178,28 @@ class Generator:
         """Compute the context-drift decision once, stash it onto `record`
         so `_record_chunk` persists it, then record the chunk and update
         rolling context accordingly. The one path both the parent-unit and
-        child-unit acceptance branches in `run()` share."""
-        decision = self._context_decision(record)
-        record["context_depth"] = decision["depth"]
-        record["context_usable"] = decision["context_usable"]
-        self._record_chunk(record)
-        self._accept_rolling(record, decision)
+        child-unit acceptance branches in `run()` share.
+
+        When ROLLING_CONTEXT_ENABLED is False (icl-nocontext-v3, the
+        default), the decision/rolling-chain machinery is skipped entirely:
+        context_depth and context_usable record as None (never computed --
+        there is no chain to measure), self._rolling never gets set so
+        every chunk's own generation call always sees context=None (see
+        _generate_with_retries), and context_chunk_id is already None
+        because context is never passed to _generate. context_high_frac
+        (the spectral field) is unaffected -- it is computed unconditionally
+        in _generate, still cheap and useful for audits.
+        """
+        if ROLLING_CONTEXT_ENABLED:
+            decision = self._context_decision(record)
+            record["context_depth"] = decision["depth"]
+            record["context_usable"] = decision["context_usable"]
+            self._record_chunk(record)
+            self._accept_rolling(record, decision)
+        else:
+            record["context_depth"] = None
+            record["context_usable"] = None
+            self._record_chunk(record)
 
     @staticmethod
     def _chunk_wav_rel(chunk: dict) -> str:
@@ -1491,11 +1527,16 @@ class Generator:
         accepted unit in this paragraph, if any): a rejected take must not
         poison the chain, and dropping context on retry removes it as a
         failure variable, so every attempt after the first generates as if
-        there were no previous chunk.
+        there were no previous chunk. When ROLLING_CONTEXT_ENABLED is False
+        (icl-nocontext-v3, the default), that "first attempt" context is
+        always None too -- every attempt of every chunk generates from the
+        Bragg reference alone.
         """
         failures = []
         validation_failures = 0
-        base_context = self._rolling_context_for(getattr(self, "_rolling", None), chunk)
+        base_context = (
+            self._rolling_context_for(getattr(self, "_rolling", None), chunk)
+            if ROLLING_CONTEXT_ENABLED else None)
         for attempt in range(4):
             if validation_failures >= 2:
                 break
@@ -2161,6 +2202,11 @@ def selfcheck() -> int:
     import tempfile
     import soundfile as sf
     import numpy as np
+
+    # Declared once, up front: two sections below flip ROLLING_CONTEXT_ENABLED
+    # temporarily to prove the icl-rolling-v2 machinery still works when
+    # re-enabled, then restore the default (False) in a finally block.
+    global ROLLING_CONTEXT_ENABLED
 
     results = []
 
@@ -2829,9 +2875,15 @@ def selfcheck() -> int:
     check("rolling context absent with no prior unit",
           Generator._rolling_context_for(None, _chunk_p2b) is None)
 
-    # Integration: `_generate_with_retries` uses context on attempt 0 only —
-    # a rejected first take must not carry its (possibly bad) context into
-    # the retry, and the retry itself must not use context either.
+    # Integration: `_generate_with_retries` uses context on attempt 0 only,
+    # and ONLY when ROLLING_CONTEXT_ENABLED is True. A rejected first take
+    # must not carry its (possibly bad) context into the retry, and the
+    # retry itself must not use context either.
+    def _ctx_generate(chunk, model, attempt=0, context=None):
+        ctx_calls.append(context)
+        peak = 0.24 if attempt == 0 else 0.0089  # fail attempt 0, pass attempt 1
+        return {"id": chunk["id"], "tail_frame_peak": peak}
+
     ctx_gen = object.__new__(Generator)
     ctx_gen.validate = False
     ctx_gen._records = {}
@@ -2839,17 +2891,34 @@ def selfcheck() -> int:
     ctx_gen.out_dir = pathlib.Path("/tmp")
     ctx_gen._rolling = _rolling_p2
     ctx_calls = []
-
-    def _ctx_generate(chunk, model, attempt=0, context=None):
-        ctx_calls.append(context)
-        peak = 0.24 if attempt == 0 else 0.0089  # fail attempt 0, pass attempt 1
-        return {"id": chunk["id"], "tail_frame_peak": peak}
-
     ctx_gen._generate = _ctx_generate
     ctx_record, ctx_failures = ctx_gen._generate_with_retries(_chunk_p2b, object())
-    check("context used on first attempt only, dropped on retry",
+    check("icl-nocontext-v3 (ROLLING_CONTEXT_ENABLED default False): context "
+          "withheld on every attempt, even with a same-paragraph prior chunk on hand",
           ctx_record is not None and len(ctx_calls) == 2
-          and ctx_calls[0] == _rolling_p2 and ctx_calls[1] is None)
+          and ctx_calls[0] is None and ctx_calls[1] is None)
+
+    # Flip the switch to prove the underlying mechanism is intact (not
+    # deleted, just gated off by default) -- restores exactly the
+    # icl-rolling-v2 first-attempt-only behavior. (ROLLING_CONTEXT_ENABLED
+    # is declared global once, at the top of this function.)
+    ROLLING_CONTEXT_ENABLED = True
+    try:
+        ctx_gen2 = object.__new__(Generator)
+        ctx_gen2.validate = False
+        ctx_gen2._records = {}
+        ctx_gen2._attempt_failures = {}
+        ctx_gen2.out_dir = pathlib.Path("/tmp")
+        ctx_gen2._rolling = _rolling_p2
+        ctx_calls = []
+        ctx_gen2._generate = _ctx_generate
+        ctx_record2, _ = ctx_gen2._generate_with_retries(_chunk_p2b, object())
+        check("switching ROLLING_CONTEXT_ENABLED back on restores context on "
+              "attempt 0 only (the machinery itself still works)",
+              ctx_record2 is not None and len(ctx_calls) == 2
+              and ctx_calls[0] == _rolling_p2 and ctx_calls[1] is None)
+    finally:
+        ROLLING_CONTEXT_ENABLED = False
 
     # _accept_rolling only tracks accepted takes that produced codec frames.
     # context_high_frac well above CONTEXT_DRIFT_HIGH_FRAC_MIN here -- these
@@ -2940,7 +3009,11 @@ def selfcheck() -> int:
               "chapter": "ch01", "text": "Second.", "codes": "codes-b", "depth": 1})
 
     # Recording: _finalize_take stashes the decision onto the record so
-    # _record_chunk persists high_frac/depth/usable regardless of outcome.
+    # _record_chunk persists it. With ROLLING_CONTEXT_ENABLED False
+    # (icl-nocontext-v3, the default), the decision is never computed --
+    # context_depth/context_usable record as None -- while context_high_frac
+    # (the spectral field, computed unconditionally in _generate) still
+    # lands untouched, since it stays useful for audits either way.
     record_gen = object.__new__(Generator)
     record_gen._rolling = None
     record_gen.done = {}
@@ -2950,11 +3023,31 @@ def selfcheck() -> int:
                "wav_sha256": "ws", "samples": 10, "seconds": 0.1,
                "terminal_silence_seconds": 0.0, "paragraph_index": 40,
                "chapter": "ch01", "_gen_codes": "codes-x", "context_high_frac": 0.001}
-    record_gen._finalize_take(rec_low)
-    check("recording fields (high_frac, depth, usable) land in the done entry",
+    record_gen._finalize_take(dict(rec_low))
+    check("with rolling context off, context_depth/context_usable record as "
+          "None while the spectral field (context_high_frac) is kept",
           record_gen.done[rec_low["id"]]["context_high_frac"] == 0.001
-          and record_gen.done[rec_low["id"]]["context_depth"] == 0
-          and record_gen.done[rec_low["id"]]["context_usable"] is False)
+          and record_gen.done[rec_low["id"]]["context_depth"] is None
+          and record_gen.done[rec_low["id"]]["context_usable"] is None
+          and record_gen.done[rec_low["id"]]["context_chunk_id"] is None)
+
+    # Flip the switch to prove the decision-recording path itself is
+    # intact -- identical to icl-rolling-v2's behavior before this change.
+    ROLLING_CONTEXT_ENABLED = True
+    try:
+        record_gen2 = object.__new__(Generator)
+        record_gen2._rolling = None
+        record_gen2.done = {}
+        record_gen2._save_records = lambda: None
+        record_gen2._save_state = lambda: None
+        record_gen2._finalize_take(dict(rec_low))
+        check("switching ROLLING_CONTEXT_ENABLED back on restores decision "
+              "recording (high_frac, depth, usable) exactly as icl-rolling-v2 did",
+              record_gen2.done[rec_low["id"]]["context_high_frac"] == 0.001
+              and record_gen2.done[rec_low["id"]]["context_depth"] == 0
+              and record_gen2.done[rec_low["id"]]["context_usable"] is False)
+    finally:
+        ROLLING_CONTEXT_ENABLED = False
 
     # Concern A: the generation policy lives on each `done` entry (see
     # GENERATION_POLICY / `_generate` / `_record_chunk`), not in
@@ -2974,6 +3067,9 @@ def selfcheck() -> int:
     policy_gen._record_chunk(new_take)
     check("a freshly generated chunk records the current generation policy",
           policy_gen.done[new_take["id"]]["generation_policy"] == GENERATION_POLICY)
+    check("generation policy reverted to context-free generation "
+          "(icl-nocontext-v3), rolling context off by default",
+          GENERATION_POLICY == "icl-nocontext-v3" and ROLLING_CONTEXT_ENABLED is False)
 
     # A chunk generated before this field existed (a real done entry from
     # outputs/qwen-book-v2, generated under "icl-rolling-v1") has no

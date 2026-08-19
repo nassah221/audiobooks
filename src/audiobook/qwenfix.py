@@ -39,6 +39,14 @@ into the reference-codes stream, so the model continues that chunk's
 prosody into this one. The x-vector speaker embedding is always computed
 from the Bragg reference wav alone, never from generated audio.
 
+As of generation policy icl-nocontext-v3, the runner's
+``ROLLING_CONTEXT_ENABLED`` switch (runner.py) is off by default: rolling
+context caused audible timbre drift within a chain even under the
+icl-rolling-v2 drift gate below, so every chunk now generates from the
+Bragg reference alone, with ``context=None`` on every call into
+``generate_icl_tail_safe``. The splicing code stays here, exercised
+directly by runner.py's selfcheck, in case a future fix revisits it.
+
 Defect 3 is caught by two validation metrics computed by the runner:
 ``tail_frame_peak`` (speech energy in the final 80 ms, which should be
 room tone) and ``final_sibilant_high_frac`` (a final word that ends in a
