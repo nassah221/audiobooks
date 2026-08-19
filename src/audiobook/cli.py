@@ -46,7 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chapters", help="comma list with ranges, e.g. 1-9,preface,names (default: all)")
     p.add_argument("--limit", type=int, help="max sentence chunks (smoke runs)")
     p.add_argument("--offline", action="store_true", help="forbid downloads (fail if cache incomplete)")
-    p.add_argument("--force", action="store_true", help="ignore resume; regenerate everything")
+    p.add_argument("--force", action="store_true",
+                   help="on a matching state: regenerate everything. On a state mismatch "
+                        "(inputs/plan changed): archive the old state.json and carry forward "
+                        "whatever done chunks still match this run, instead of erroring")
+    p.add_argument("--discard-done", action="store_true",
+                   help="on a state mismatch, explicitly wipe recorded done/failed progress "
+                        "(the old state.json is archived first, never silently discarded)")
     p.add_argument("--resume-from", help="skip chapters before this one (e.g. ch03)")
 
     p = sub.add_parser("validate", help="persistent Whisper ASR validation of generated chunks")
@@ -136,7 +142,8 @@ def main(argv=None) -> int:
         elif args.cmd == "generate":
             summary = runner.Generator(
                 root, out, chapters=args.chapters, limit=args.limit,
-                force=args.force, resume_from=args.resume_from,
+                force=args.force, discard_done=args.discard_done,
+                resume_from=args.resume_from,
                 offline=True if args.offline else None,
             ).run()
             print(f"generated {summary['generated']} chunk(s); {summary['done_total']}/"

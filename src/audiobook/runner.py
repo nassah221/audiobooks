@@ -787,10 +787,18 @@ class Generator:
     """Resumable full-book generation with atomic PCM16 checkpoints."""
 
     def __init__(self, root, out_dir, *, chapters=None, limit=None, force=False,
-                 resume_from=None, offline=None, validate=True, config=None):
+                 discard_done=False, resume_from=None, offline=None, validate=True,
+                 config=None):
         self.root = pathlib.Path(root)
         self.out_dir = pathlib.Path(out_dir)
         self.force = force
+        # See _load_state: a stronger, separate flag from `force` -- force
+        # alone never discards a mismatched run's recorded progress (it
+        # archives it and carries it forward, since the individual
+        # per-chunk text_sha256 checks already keep anything genuinely
+        # stale from counting as done). discard_done is the explicit,
+        # loud opt-in to actually zero it.
+        self.discard_done = discard_done
         self.validate = validate
         self.offline = offline
         self.config = config if config is not None else load_config(self.root)
@@ -854,6 +862,20 @@ class Generator:
             "total_groups": self.plan["total_groups"],
         }
 
+    def _archive_state(self) -> pathlib.Path:
+        """Rename the existing state.json aside (state.json.bak-<n>, lowest
+        unused n) before a mismatch is acknowledged via --force or
+        --discard-done -- so the discarded record is never lost even when
+        the run proceeds, only left where a human can recover it."""
+        n = 1
+        while True:
+            candidate = self.state_path.with_name(f"{self.state_path.name}.bak-{n}")
+            if not candidate.exists():
+                break
+            n += 1
+        self.state_path.replace(candidate)
+        return candidate
+
     def _load_state(self):
         self.done = {}
         # Continue-on-failure set: chunk id -> {text_sha256, reasons,
@@ -866,18 +888,47 @@ class Generator:
         self.started_unix = time.time()
         if self.state_path.is_file():
             st = json.loads(self.state_path.read_text())
-            if st.get("fingerprint") != self.fingerprint or \
-                    not _state_plan_matches(st.get("plan"), self.plan):
-                if not self.force:
-                    raise RunError(
-                        f"existing state at {self.state_path} does not match this run "
-                        "(inputs/model/reference/chapters/limit changed). Use --force to "
-                        "discard resume and regenerate, or a fresh --out."
-                    )
-            else:
+            fp_matches = st.get("fingerprint") == self.fingerprint
+            relation = _state_plan_relation(st.get("plan"), self.plan) if fp_matches else "conflict"
+            if fp_matches and relation != "conflict":
                 self.done = st.get("done", {})
                 self.failed = st.get("failed", {})
                 self.started_unix = st.get("started_unix", self.started_unix)
+            elif not self.force and not self.discard_done:
+                raise RunError(
+                    f"existing state at {self.state_path} does not match this run "
+                    "(inputs/model/reference changed, or the requested chapters/limit "
+                    "conflict with previously recorded chunks). Use --force to archive "
+                    "the old state and carry forward whatever done chunks still match "
+                    "this run, --discard-done to explicitly wipe recorded progress "
+                    "(archived first, never silently), or a fresh --out."
+                )
+            else:
+                # Acknowledged: archive the old file before this run's
+                # _save_state below overwrites it, so the discarded record
+                # is always recoverable -- never a silent loss.
+                old_done, old_failed = st.get("done", {}) or {}, st.get("failed", {}) or {}
+                archived = self._archive_state()
+                if self.discard_done:
+                    print(
+                        f"  --discard-done: discarding {len(old_done)} done chunk(s) and "
+                        f"{len(old_failed)} failed entry(ies) from the mismatched state "
+                        f"(archived to {archived.name}; wav files on disk are untouched)",
+                        file=sys.stderr,
+                    )
+                else:
+                    # --force alone never zeros done: carry the old record
+                    # forward. Any entry that no longer matches THIS run's
+                    # plan simply won't count as done (_unit_done checks
+                    # text_sha256 per chunk), so nothing stale is reused.
+                    self.done, self.failed = old_done, old_failed
+                    print(
+                        f"  --force: state mismatch archived to {archived.name}; "
+                        f"carrying forward {len(old_done)} previously-done chunk(s) and "
+                        f"{len(old_failed)} failed entry(ies) (only ones matching this "
+                        "run's plan will still count as done)",
+                        file=sys.stderr,
+                    )
         self._save_state()
 
     def _save_state(self):
@@ -2938,6 +2989,31 @@ def selfcheck() -> int:
         conflict_gen = _make_state_gen(td, _conflict_plan)
         check("a genuinely conflicting plan raises without --force/--discard-done",
               _raises(RunError, conflict_gen._load_state))
+
+    # --- concern C: safe --force / --discard-done on a state mismatch ------
+    with tempfile.TemporaryDirectory() as td:
+        _seed_state(td, cur_plan, _seed_done)
+
+        # --force on a conflict archives the old state.json and carries
+        # done forward -- it never zeroes it outright.
+        force_gen = _make_state_gen(td, _conflict_plan)
+        force_gen.force = True
+        force_gen._load_state()
+        backup1 = force_gen.out_dir / "state.json.bak-1"
+        check("--force archives the mismatched state.json instead of deleting it",
+              backup1.is_file()
+              and json.loads(backup1.read_text())["done"][_ca["id"]]["wav_sha256"] == "sa")
+        check("--force carries the old done record forward rather than zeroing it",
+              force_gen.done.get(_ca["id"], {}).get("wav_sha256") == "sa")
+
+        # --discard-done on a fresh mismatch explicitly zeroes done -- but
+        # still archives first, never silently.
+        _seed_state(td, cur_plan, _seed_done)
+        discard_gen = _make_state_gen(td, _conflict_plan)
+        discard_gen.discard_done = True
+        discard_gen._load_state()
+        check("--discard-done explicitly zeroes done after archiving (never silent)",
+              discard_gen.done == {} and (force_gen.out_dir / "state.json.bak-2").is_file())
 
     failed = [name for name, ok in results if not ok]
     print(f"selfcheck: {len(results) - len(failed)}/{len(results)} passed")
