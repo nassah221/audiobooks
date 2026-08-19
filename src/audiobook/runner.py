@@ -942,6 +942,15 @@ class Generator:
                         "run's plan will still count as done)",
                         file=sys.stderr,
                     )
+        # Reconcile on load: a chunk already in `done` may still have a
+        # stale continue-on-failure entry for itself or a clause-split
+        # descendant of it (see _clear_resolved_failures) -- e.g. a parent
+        # was regenerated whole and passed after one of its children had
+        # already exhausted its retry budget. Clearing this here, on every
+        # load, heals a directory that fell out of sync on its very next
+        # `generate`/`validate` invocation, with no hand-editing.
+        for done_id in list(self.done):
+            self._clear_resolved_failures(done_id)
         self._save_state()
 
     def _save_state(self):
@@ -986,6 +995,40 @@ class Generator:
         if chunk["id"] in self.failed:
             return True
         return any(child["id"] in self.failed for child in self._child_chunks(chunk))
+
+    def _clear_resolved_failures(self, chunk_id: str) -> None:
+        """Drop `chunk_id`, and any clause-split child of it, from the
+        continue-on-failure set now that `chunk_id` itself is done.
+
+        A clause-split child's id is always `f"{parent_id}:c{n:04d}"`
+        (see `_child_chunks`), so once the parent is done as ONE whole
+        unit, any failed entry recorded against one of its children is
+        stale: the parent's audio already covers that child's text span
+        end to end, so there is no missing audio, only a leftover
+        bookkeeping entry. Left alone, that entry makes `validate` and
+        `generate` refuse assembly forever ("N chunk(s) in the
+        continue-on-failure set") even though nothing needs fixing.
+        Called both when a chunk freshly completes (`_record_chunk`,
+        `_maybe_promote_failed`) and when state.json loads (`_load_state`),
+        so an already-mismatched directory heals on its next run with no
+        hand-editing.
+
+        The symmetric case -- a child itself re-passing -- clears its own
+        entry the same way (a child has no children of its own, so the
+        loop below is simply empty for it).
+
+        getattr guard: minimal test doubles built with
+        object.__new__(Generator) predate `failed` and never set it;
+        this is a pure bookkeeping side effect, not core to what those
+        tests exercise.
+        """
+        failed = getattr(self, "failed", None)
+        if not isinstance(failed, dict):
+            return
+        failed.pop(chunk_id, None)
+        prefix = f"{chunk_id}:c"
+        for fid in [f for f in failed if f.startswith(prefix) and f[len(prefix):].isdigit()]:
+            del failed[fid]
 
     def _pending_chunks(self):
         # `force` has two distinct meanings that must not collapse into
@@ -1103,6 +1146,10 @@ class Generator:
                 "context_depth": record.get("context_depth"),
                 "context_usable": record.get("context_usable"),
             }
+        # This chunk is done: any lingering continue-on-failure entry for
+        # it, or for a clause-split child of it, is now stale (see
+        # _clear_resolved_failures).
+        self._clear_resolved_failures(record["id"])
         # Persist the record before state marks this unit done.
         self._save_records()
         self._save_state()
@@ -1190,7 +1237,7 @@ class Generator:
             "tail_frame_peak": tail_frame_peak,
             "context_chunk_id": None,
         }
-        del self.failed[chunk["id"]]
+        self._clear_resolved_failures(chunk["id"])
         self._save_records()
         self._save_state()
         print(f"  {chunk['id']}  promoted from failed set (revalidated, no TTS call)")
@@ -1744,7 +1791,8 @@ class Generator:
                     self._finalize_take(child_record)
                     records.append(child_record)
             else:
-                self.failed.pop(chunk["id"], None)
+                # _finalize_take -> _record_chunk clears any stale
+                # self.failed[chunk["id"]] (see _clear_resolved_failures).
                 self._finalize_take(record)
                 records = [record]
             if not records:
@@ -3044,6 +3092,74 @@ def selfcheck() -> int:
     check("assembly refuses (plan incomplete) while a chunk is in the failed set",
           not refuse_gen._plan_complete())
 
+    _dd_parent = dict(_ca, eligible_clause_spans=[_span_a, _span_b])
+    _dd_helper = object.__new__(Generator)
+    _dd_child = _dd_helper._child_chunks(_dd_parent)[0]
+
+    # 4d. Defect 1 (stale orphaned child): the actual production shape --
+    # a chunk was clause-split, one child exhausted its retry budget and
+    # landed in `failed`, and the PARENT was later regenerated as one
+    # whole unit that passes. The parent's audio covers the child's text
+    # span end to end, so the child's failed entry is now describing
+    # nothing missing -- it must clear the moment the parent enters
+    # `done`, whether that happens via a fresh `_record_chunk` call
+    # (below) or via `_load_state` reconciling an already-written
+    # state.json (4e).
+    recon_gen = object.__new__(Generator)
+    recon_gen.done = {}
+    recon_gen.failed = {_dd_child["id"]: {
+        "text_sha256": _dd_child["text_sha256"], "reasons": ["attempt 1: mandatory missing"],
+    }}
+    recon_gen._records = {}
+    recon_gen._save_records = lambda: None
+    recon_gen._save_state = lambda: None
+    recon_gen._record_chunk({
+        "id": _dd_parent["id"], "text_sha256": _dd_parent["text_sha256"],
+        "wav": "p.wav", "wav_sha256": "wsp", "samples": 3, "seconds": 0.1,
+        "terminal_silence_seconds": 0.0,
+    })
+    check("completion-time reconciliation clears a stale child failure once the whole parent completes",
+          _dd_child["id"] not in recon_gen.failed and _dd_parent["id"] in recon_gen.done)
+
+    # 4e. Symmetric case (should "already work", per the ticket): a child
+    # completing on its own clears its OWN failed entry the same way.
+    child_recon_gen = object.__new__(Generator)
+    child_recon_gen.done = {}
+    child_recon_gen.failed = {_dd_child["id"]: {
+        "text_sha256": _dd_child["text_sha256"], "reasons": ["attempt 1: mandatory missing"],
+    }}
+    child_recon_gen._records = {}
+    child_recon_gen._save_records = lambda: None
+    child_recon_gen._save_state = lambda: None
+    child_recon_gen._record_chunk({
+        "id": _dd_child["id"], "text_sha256": _dd_child["text_sha256"],
+        "wav": "c.wav", "wav_sha256": "wsc", "samples": 1, "seconds": 0.05,
+        "terminal_silence_seconds": 0.0,
+    })
+    check("a child's own failure entry clears when the child itself completes",
+          _dd_child["id"] not in child_recon_gen.failed and _dd_child["id"] in child_recon_gen.done)
+
+    # 4f. Negative case (must NOT reconcile): a failed child stays failed
+    # when an unrelated chunk completes -- reconciliation only fires for
+    # the id that just completed and ITS OWN descendants, never globally.
+    unrelated_gen = object.__new__(Generator)
+    unrelated_gen.done = {}
+    unrelated_gen.failed = {_dd_child["id"]: {
+        "text_sha256": _dd_child["text_sha256"], "reasons": ["attempt 1: mandatory missing"],
+    }}
+    unrelated_gen._records = {}
+    unrelated_gen._save_records = lambda: None
+    unrelated_gen._save_state = lambda: None
+    _unrelated_text = "An unrelated chunk elsewhere in the plan."
+    unrelated_gen._record_chunk({
+        "id": "ch01:p0999:s0000-0001", "text_sha256": sha256_text(_unrelated_text),
+        "wav": "o.wav", "wav_sha256": "wso", "samples": 1, "seconds": 0.05,
+        "terminal_silence_seconds": 0.0,
+    })
+    check("a failed child with no done entry covering its parent stays failed "
+          "(an unrelated completion never clears it)",
+          _dd_child["id"] in unrelated_gen.failed)
+
     # 5. Regression: nothing changes when nothing has failed -- pending
     # order stays exactly plan order, same as before this feature.
     noop_gen = object.__new__(Generator)
@@ -3104,6 +3220,41 @@ def selfcheck() -> int:
         check("a superset-plan resume loads without error and keeps the stored done chunk",
               widen_gen.done.get(_ca["id"], {}).get("wav_sha256") == "sa"
               and _cb["id"] not in widen_gen.done and _cc["id"] not in widen_gen.done)
+
+    # Defect 1, end to end: a state.json written to disk with a done
+    # parent and a stale failed descendant (the exact shape of the live
+    # outputs/qwen-book-v2 directory) reconciles the moment ANY Generator
+    # loads it -- the fix this ticket asked for, "heals on the next run
+    # without hand-editing" -- and the healed state is written back to
+    # disk, not just held in memory for this one process.
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        dd2_wav = td / "dd2-parent.wav"
+        _make_wav(dd2_wav, [1, 2, 3])
+        _dd_plan = {"planner": _planner,
+                    "chapters": [{"id": "ch01", "title": "T", "paragraphs": 1, "groups": 1}],
+                    "chunks": [_dd_parent], "total_paragraphs": 1, "total_groups": 1}
+        _dd_done = {_dd_parent["id"]: {
+            "text_sha256": _dd_parent["text_sha256"], "wav": dd2_wav.name,
+            "wav_sha256": sha256_file(dd2_wav), "samples": 3, "seconds": 0.1,
+            "terminal_silence_seconds": 0.0,
+        }}
+        _dd_failed = {_dd_child["id"]: {
+            "text_sha256": _dd_child["text_sha256"],
+            "reasons": ["attempt 1: mandatory missing"],
+        }}
+        dd_seed = _make_state_gen(td, _dd_plan, fingerprint="fp-dd")
+        dd_seed.done, dd_seed.failed, dd_seed.started_unix = _dd_done, _dd_failed, 0.0
+        dd_seed._save_state()
+
+        dd_load = _make_state_gen(td, _dd_plan, fingerprint="fp-dd")
+        dd_load._load_state()
+        check("load-time reconciliation clears a stale child failure once its parent is done on disk",
+              dd_load.done.get(_dd_parent["id"], {}).get("wav_sha256") == sha256_file(dd2_wav)
+              and _dd_child["id"] not in dd_load.failed)
+        persisted = json.loads(dd_load.state_path.read_text())
+        check("the healed state.json is written back to disk, not just held in this process's memory",
+              _dd_child["id"] not in persisted.get("failed", {}))
 
     with tempfile.TemporaryDirectory() as td:
         _seed_state(td, cur_plan, _seed_done)
