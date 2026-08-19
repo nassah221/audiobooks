@@ -52,6 +52,7 @@ import json
 import os
 import pathlib
 import re
+import unicodedata
 import sys
 import time
 from collections import Counter
@@ -66,7 +67,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v27-thousand-hundred-compound"
+VALIDATION_POLICY = "paragraph-v28-accent-folding"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -343,6 +344,18 @@ def sha256_bytes(b: bytes) -> str:
 def tokenize(text: str) -> list:
     """Normalize spoken and written text into comparable tokens."""
     t = text.lower().replace("\u2019", "'")
+    # Fold accented Latin letters to their base ASCII form (e/e/i/i/a/a/..
+    # for e,\u00e9,i,\u00ed,a,\u00e2,..) before the punctuation-stripping
+    # regex below: an accent is not punctuation, but the regex's ASCII-only
+    # allowlist would otherwise delete the letter entirely -- "Rio" (source
+    # "R\u00edo") became "r"+"o", two garbage tokens, when Whisper (which
+    # renders these names in plain ASCII) said "Rio". NFKD decomposition
+    # separates a base letter from its combining accent mark (category Mn),
+    # which is then dropped; a symmetric fold, so an accented ASR token
+    # (Whisper occasionally emits one) agrees with a plain-ASCII source
+    # token, and vice versa, regardless of which side has the accent.
+    t = "".join(ch for ch in unicodedata.normalize("NFKD", t)
+                if not unicodedata.combining(ch))
     t = _DECIMAL_RE.sub(r"\1 point \2", t)
     t = _NUMERIC_RANGE_RE.sub(r"\1 to \2", t)
     t = _DECADE_NUMERIC_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}s", t)
@@ -1687,6 +1700,28 @@ def selfcheck() -> int:
                           ["two thousand five hundred"])["missing"] == [])
     check("thousand plus a non-hundred remainder stays unmerged",
           tokenize("two thousand fifty") != tokenize("2050"))
+
+    # v28: an accented Latin letter is a letter, not punctuation -- fold it
+    # to its base ASCII form (NFKD decompose, drop combining marks) instead
+    # of deleting it. "Río" was becoming "r"+"o" (two garbage tokens)
+    # against Whisper's plain-ASCII "Rio", failing terminal by construction.
+    check("accented proper noun folds to plain ASCII",
+          tokenize("Río de la Plata") == ["rio", "de", "la", "plata"])
+    check("circumflex folds to plain ASCII",
+          tokenize("the coup de grâce") == ["the", "coup", "de", "grace"])
+    check("tilde folds to plain ASCII", tokenize("São Paulo") == ["sao", "paulo"])
+    check("cedilla folds to plain ASCII", tokenize("François") == ["francois"])
+    check("acute accent folds to plain ASCII", tokenize("café") == ["cafe"])
+    check("umlaut folds to plain ASCII", tokenize("Müller") == ["muller"])
+    check("accent folding is symmetric (accented transcript, plain source)",
+          tokenize("Rio de la Plata") == tokenize("Río de la Plata"))
+    check("punctuation is still stripped after accent folding",
+          tokenize("Café, naïve—résumé!") == ["cafe", "naive", "resume"])
+    check("digits and apostrophes still handled as before",
+          tokenize("world's fourteen oh five") == ["world's", "1405"])
+    check("plain ASCII text is byte-identical to the pre-fix output",
+          tokenize("The DEATH, of Tamerlane in 1405!") ==
+          ["the", "death", "of", "tamerlane", "in", "1405"])
     check("tokenize lowercases + strips punctuation",
           tokenize("The DEATH, of Tamerlane!") == ["the", "death", "of", "tamerlane"])
     check("number words -> digits", tokenize("fourteen oh five") == ["1405"])
