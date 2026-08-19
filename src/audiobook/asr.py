@@ -66,7 +66,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v25-phonetic-match-propagation"
+VALIDATION_POLICY = "paragraph-v26-curated-phrase-pairs"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -601,13 +601,15 @@ def ordered_coverage(expected: list, asr: list, phonetic_matches: dict = None) -
     at sentence scale.
 
     `expected` first has any recorded phonetic matches substituted in
-    (`_apply_phonetic_matches`), then both lists are reconciled across
-    hyphen/compound-word boundaries (`_reconcile_concat_boundaries`): a
-    token-boundary difference like "waste lands" / "wastelands" is
-    orthography-only, so it must not cost a match here any more than it
-    does in the mandatory-word gate.
+    (`_apply_phonetic_matches`), then any curated phrase-pair variant
+    actually present in `asr` (`_apply_phrase_pairs`), then both lists are
+    reconciled across hyphen/compound-word boundaries
+    (`_reconcile_concat_boundaries`): a token-boundary difference like
+    "waste lands" / "wastelands" is orthography-only, so it must not cost
+    a match here any more than it does in the mandatory-word gate.
     """
     expected = _apply_phonetic_matches(expected, phonetic_matches)
+    expected, phrase_pair_matches = _apply_phrase_pairs(expected, asr)
     expected, asr = _reconcile_concat_boundaries(expected, asr)
     n, m = len(expected), len(asr)
     dp = [[0] * (m + 1) for _ in range(n + 1)]
@@ -634,6 +636,7 @@ def ordered_coverage(expected: list, asr: list, phonetic_matches: dict = None) -
         "matched_tokens": matched,
         "fraction": round(matched / n, 4) if n else 1.0,
         "missing": missing,
+        "phrase_pair_matches": phrase_pair_matches,
     }
 
 
@@ -732,6 +735,58 @@ def _find_transliteration_match(word: str, asr: list) -> str:
         if _is_transliteration_pair(word, candidate):
             return candidate
     return None
+
+
+# Curated PHRASE-level transliteration pairs: a fixed multi-word sequence
+# naming one entity/title, where one short function word inside it (an
+# article/preposition, <= 3 chars) has an alternate rendering. Matched and
+# substituted as a whole, positionally-aligned sequence -- never a bare
+# word pair -- so the equivalence exists only inside this exact phrase; a
+# "da"/"de" swap anywhere else in the text is still a real mismatch (the
+# v23 guard this structure exists specifically to respect).
+#
+# Self-extension lane (phrase form): add a phrase pair without stopping
+# only when ALL hold: (1) both attempts are otherwise content-correct,
+# the only miss is one short (<= 3 char) function word inside the phrase;
+# (2) the variance is a single vowel or single-character difference in
+# that function word; (3) the phrase names one fixed entity or title, not
+# free text; (4) commit the addition on its own with the evidence.
+#
+# Seeded from ch02: "Estado da India" (source spelling, the Portuguese
+# crown's colonial administration in Asia -- one fixed historical entity,
+# recurring across the colonial chapters) transcribed as "Estado de
+# India" -- Whisper reducing the Portuguese /dɐ/ in "da" to "de", a vowel
+# distinction in a foreign monosyllable embedded in an English sentence.
+_TRANSLITERATION_PHRASE_PAIRS = (
+    (("estado", "da", "india"), ("estado", "de", "india")),
+)
+
+
+def _apply_phrase_pairs(expected: list, asr: list) -> tuple:
+    """Rewrite `expected` so a curated phrase-pair variant (see
+    `_TRANSLITERATION_PHRASE_PAIRS`) actually present in `asr` replaces the
+    source's own spelling of that phrase. Returns (rewritten_expected,
+    fired) where `fired` maps the source phrase to the transcript phrase
+    it was aligned to, for the morning audit."""
+    out = list(expected)
+    fired = {}
+    for variants in _TRANSLITERATION_PHRASE_PAIRS:
+        for variant in variants:
+            n = len(variant)
+            i = 0
+            while i + n <= len(out):
+                if tuple(out[i:i + n]) == variant:
+                    for alt in variants:
+                        if alt == variant:
+                            continue
+                        m = len(alt)
+                        if any(tuple(asr[j:j + m]) == alt
+                               for j in range(len(asr) - m + 1)):
+                            out[i:i + n] = list(alt)
+                            fired[" ".join(variant)] = " ".join(alt)
+                            break
+                i += 1
+    return out, fired
 
 
 def _phrase_in(asr: list, phrase: list, ratio: float) -> bool:
@@ -963,19 +1018,22 @@ def terminal_suffix(expected: list, asr: list, size: int = 5, phonetic_matches: 
     """Require the final expected phrase near the end of the transcript.
 
     Phonetic matches already recorded by the mandatory gate are substituted
-    in first (`_apply_phonetic_matches`), then both are reconciled across
+    in first (`_apply_phonetic_matches`), then any curated phrase-pair
+    variant (`_apply_phrase_pairs`), then both are reconciled across
     hyphen/compound-word boundaries, same as `ordered_coverage`, so a tail
     like "waste lands were colonized" matches a transcript ending
     "wastelands were colonised" -- the reported `expected` phrase reflects
     the reconciled tail actually checked.
     """
     expected = _apply_phonetic_matches(expected, phonetic_matches)
+    expected, phrase_pair_matches = _apply_phrase_pairs(expected, asr)
     r_expected, r_asr = _reconcile_concat_boundaries(expected, asr)
     tail = r_expected[-size:]
     window = r_asr[-(len(tail) + 2):]
     return {
         "expected": " ".join(tail),
         "matched": not tail or _phrase_in(window, tail, MANDATORY_FUZZY_RATIO),
+        "phrase_pair_matches": phrase_pair_matches,
     }
 
 
@@ -1784,6 +1842,29 @@ def selfcheck() -> int:
     check("coverage arithmetic on an ordinary long sentence is unchanged",
           ordered_coverage(long_expected, long_asr, {})["fraction"] == 1.0)
 
+    # v26: curated PHRASE pairs (never a bare word pair) -- a fixed
+    # multi-word sequence naming one entity, where one short (<= 3 char)
+    # function word inside it has an alternate rendering. The equivalence
+    # exists only inside the exact phrase, so a bare "da"/"de" swap
+    # anywhere else stays a real mismatch (the v23 guard this respects).
+    estado_expected = tokenize(
+        "Golden Goa had become the capital of their Estado da India.")
+    estado_asr = tokenize(
+        "Golden Goa had become the capital of their Estado de India.")
+    estado_term = terminal_suffix(estado_expected, estado_asr)
+    check("Estado da India / Estado de India passes the terminal-phrase gate",
+          estado_term["matched"] and
+          estado_term["phrase_pair_matches"] == {"estado da india": "estado de india"},
+          repr(estado_term))
+    estado_cov = ordered_coverage(estado_expected, estado_asr)
+    check("Estado da India / Estado de India passes coverage",
+          estado_cov["missing"] == [] and estado_cov["fraction"] == 1.0 and
+          estado_cov["phrase_pair_matches"] == {"estado da india": "estado de india"},
+          repr(estado_cov))
+    check("a bare 'da'/'de' swap outside the curated phrase stays a real mismatch",
+          not terminal_suffix(tokenize("he gave da book to her"),
+                              tokenize("he gave de book to her"))["matched"])
+
     # Hyphen-boundary equivalence: a hyphen changes spelling, never sound, so
     # a mandatory word split across adjacent ASR tokens (or vice versa) is a
     # full, exact match -- not a fragile demotion, since there is no
@@ -2160,7 +2241,8 @@ def selfcheck() -> int:
                      "punctuation": schema_punctuation, "verdict": "PASS"}
     serialized = json.loads(json.dumps(schema_record))
     check("serialized record preserves terminal matched state",
-          serialized["terminal"] == {"expected": "alpha omega", "matched": True})
+          serialized["terminal"] ==
+          {"expected": "alpha omega", "matched": True, "phrase_pair_matches": {}})
     missing_terminal = terminal_suffix(tokenize("alpha omega"), tokenize("alpha"))
     check("serialized record preserves terminal missing state",
           json.loads(json.dumps({"terminal": missing_terminal}))["terminal"]["matched"] is False)
