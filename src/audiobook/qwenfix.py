@@ -65,6 +65,29 @@ TAIL_FRAME_PEAK_MAX = 0.02
 # Final words that end in a sibilant sound (including -sed/-ced/-xed
 # forms like "collapsed" /st/) must show high-band energy near the end.
 SIBILANT_FINAL = re.compile(r"(s|se|ss|ce|x|z|sh|ch|ge|dge)(ed)?$", re.I)
+
+# Words whose final "-ch" is pronounced /k/ (Greek-derived), not the
+# affricate SIBILANT_FINAL's "ch" branch assumes: "monarch" ends in a
+# plain stop, with no sibilant/affricate energy at all, so the gate
+# rejected every correctly-pronounced take of it. Exact whole-word match
+# only (case-insensitive) -- "-arch" as a suffix pattern would wrongly
+# exclude "march"/"starch", whose -ch IS a genuine affricate. Plurals need
+# no entry here: "monarchs" ends in s and genuinely carries sibilant
+# energy, so SIBILANT_FINAL is already correct for it.
+#
+# Self-extension lane, ALL conditions required: (1) the word ends in -ch
+# with a dictionary-verifiable /k/ pronunciation (the Greek-derived
+# class); (2) it failed the sibilant gate on >= 2 attempts with takes
+# that were otherwise valid; (3) each addition is its own tiny commit
+# citing the failure. Ambiguous pronunciations stop the line.
+#
+# Seeded from ch02:p0066 -- "monarch" failed this gate on all 4 attempts,
+# then all 4 more after falling to the child chunk, every take otherwise
+# valid.
+SIBILANT_FINAL_CH_IS_K = frozenset({
+    "monarch", "patriarch", "matriarch", "oligarch", "hierarch",
+    "epoch", "stomach", "eunuch",
+})
 SIBILANT_HIGH_FRAC_MIN = 0.03
 SIBILANT_WINDOW_SECONDS = 0.35
 
@@ -426,14 +449,20 @@ def final_sibilant_high_frac(audio, sample_rate, text):
     """4-10 kHz energy fraction near the end of speech, or None.
 
     Returns None when the chunk's final word does not end in a sibilant
-    sound; otherwise the maximum high-band fraction over 25 ms windows
-    (RMS above 0.002) in the last 350 ms of speech. A complete sibilant
-    measures well above SIBILANT_HIGH_FRAC_MIN; a clipped one does not.
+    sound, or ends in "-ch" but is in SIBILANT_FINAL_CH_IS_K (a
+    Greek-derived word where "ch" is /k/, not an affricate -- e.g.
+    "monarch"); otherwise the maximum high-band fraction over 25 ms
+    windows (RMS above 0.002) in the last 350 ms of speech. A complete
+    sibilant measures well above SIBILANT_HIGH_FRAC_MIN; a clipped one
+    does not.
     """
     import numpy as np
 
     words = [w for w in re.findall(r"[\w']+", text)]
-    if not words or not SIBILANT_FINAL.search(words[-1].lower()):
+    if not words:
+        return None
+    last = words[-1].lower()
+    if last in SIBILANT_FINAL_CH_IS_K or not SIBILANT_FINAL.search(last):
         return None
     x = np.asarray(audio)
     nonquiet = np.flatnonzero(np.abs(x) > _SILENCE_AMPLITUDE)

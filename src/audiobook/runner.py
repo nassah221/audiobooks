@@ -2082,6 +2082,36 @@ def selfcheck() -> int:
           and qwenfix.SIBILANT_FINAL.search("delhi") is None
           and qwenfix.SIBILANT_FINAL.search("planned") is None)
 
+    # Greek-derived word-final "-ch" is /k/, not the affricate
+    # SIBILANT_FINAL's "ch" branch assumes -- "monarch" failed this gate
+    # on 8 straight attempts (ch02:p0066) despite every take being a
+    # correct, silent-release /k/. Whole-word exclusion only: plurals and
+    # genuine -ch affricates ("church", "match") still require the check.
+    check("monarch (Greek -ch = /k/) no longer requires the sibilant check",
+          qwenfix.final_sibilant_high_frac(
+              np.zeros(4000, dtype=np.float32), 16000,
+              "an exceptionally determined and aggressive monarch.") is None)
+    check("church/match/monarchs still require the sibilant check",
+          qwenfix.SIBILANT_FINAL.search("church") and "church" not in qwenfix.SIBILANT_FINAL_CH_IS_K
+          and qwenfix.SIBILANT_FINAL.search("match") and "match" not in qwenfix.SIBILANT_FINAL_CH_IS_K
+          and qwenfix.SIBILANT_FINAL.search("monarchs")
+          and "monarchs" not in qwenfix.SIBILANT_FINAL_CH_IS_K)
+    _monarch_text = ("Yung-lo, the second founder, who reigned from fourteen oh three to "
+                     "fourteen twenty-four was an exceptionally determined and aggressive monarch.")
+    _monarch_chunk = {"id": "ch02:p0066:s0000-0003:o000000-000446:c0002", "text": _monarch_text}
+    monarch_gen = object.__new__(Generator)
+    monarch_gen._attempt_failures = {}
+    monarch_gen.out_dir = pathlib.Path("/tmp")
+    monarch_gen.validate = False
+    monarch_gen._generate = lambda chunk, model, attempt=0, context=None: {
+        "id": chunk["id"], "tail_frame_peak": 0.001,
+        "final_sibilant_high_frac": qwenfix.final_sibilant_high_frac(
+            np.zeros(1000, dtype=np.float32), 16000, chunk["text"]),
+    }
+    monarch_record, monarch_failures = monarch_gen._generate_with_retries(_monarch_chunk, object())
+    check("the failing monarch chunk's replay passes end to end with no retries",
+          monarch_record is not None and not monarch_failures)
+
     # Decode shape bucketing (pure array op; no model load).
     import mlx.core as mx
 
