@@ -1002,7 +1002,10 @@ class Generator:
             "chunk_id": record["id"],
             "paragraph_index": record["paragraph_index"],
             "chapter": record["chapter"],
-            "text": record["text"],
+            # speak_text, not text: these codes were synthesized from
+            # speak_text (see _generate), so the ICL context handed to the
+            # next chunk must describe the text that actually produced them.
+            "text": record.get("speak_text", record["text"]),
             "codes": codes,
         }
 
@@ -1029,9 +1032,15 @@ class Generator:
         t0 = time.perf_counter()
         seed = self._seed(inv["seed"], chunk["id"], attempt)
         mx.random.seed(seed)
+        # speak_text (v31): speak-time-only text substitution for the
+        # "Name + roman numeral" mispronunciation hazard (see
+        # asr.normalize_for_tts's docstring). The TTS receives speak_text,
+        # not chunk["text"] -- plan identity, chunk ids, and text_sha256
+        # stay bound to the untouched original everywhere else.
+        speak_text = asr.normalize_for_tts(chunk["text"])
         context_arg = (context["text"], context["codes"]) if context is not None else None
         audio, gen_codes = qwenfix.generate_icl_tail_safe(
-            model, chunk["text"], self._ref_audio_array(), self.ref_text,
+            model, speak_text, self._ref_audio_array(), self.ref_text,
             inv["lang_code"], inv["max_tokens"], context=context_arg)
         gen_seconds = time.perf_counter() - t0
         import numpy as np
@@ -1039,7 +1048,7 @@ class Generator:
 
         tail_frame_peak = qwenfix.tail_frame_peak(audio, SAMPLE_RATE)
         sibilant_frac = qwenfix.final_sibilant_high_frac(
-            audio, SAMPLE_RATE, chunk["text"])
+            audio, SAMPLE_RATE, speak_text)
         rel = f"chunks/{chunk['chapter']}/{chunk['id'].replace(':', '-')}.wav"
         wav = self.out_dir / rel
         wav.parent.mkdir(parents=True, exist_ok=True)
@@ -1071,6 +1080,7 @@ class Generator:
             "clause_spans": chunk.get("clause_spans", []),
             "source_span": chunk["source_span"], "word_count": chunk["word_count"],
             "text": chunk["text"], "text_sha256": chunk["text_sha256"],
+            "speak_text": speak_text,
             "wav": rel, "wav_sha256": facts["sha256"],
             "sample_rate": facts["sample_rate"], "channels": facts["channels"],
             "subtype": facts["subtype"], "samples": facts["samples"],
@@ -1095,7 +1105,9 @@ class Generator:
         """Validate one take without checkpointing its verdict."""
         return self._validator().validate_many([{
             "wav": str(self.out_dir / record["wav"]),
-            "expected_text": chunk["text"],
+            # speak_text: the ASR comparison target is what was actually
+            # spoken (see _generate/asr.normalize_for_tts), not chunk["text"].
+            "expected_text": record.get("speak_text", chunk["text"]),
             "chunk_id": record["id"],
         }])[0]
 
@@ -1475,7 +1487,11 @@ def validate_generated(root, out_dir, *, chapters=None, limit=None, config=None)
             wav = out_dir / d["wav"]
             if not wav.is_file():
                 continue
-            specs.append({"wav": str(wav), "expected_text": chunk["text"],
+            # speak_text: standalone `validate` must compare against the same
+            # text that was actually spoken as live generation does, or the
+            # numeral-hazard rewrite (asr.normalize_for_tts) causes the exact
+            # false failures it exists to prevent when re-run here.
+            specs.append({"wav": str(wav), "expected_text": asr.normalize_for_tts(chunk["text"]),
                           "chunk_id": chunk["id"]})
     if not specs:
         raise RunError("no generated chunks to validate")
@@ -2161,6 +2177,31 @@ def selfcheck() -> int:
                                  "text": "no codes"})
     check("record without codes leaves rolling context unchanged",
           accept_gen._rolling["chunk_id"] == "ch01:p0002:s0002")
+
+    # v31: _accept_rolling must track speak_text (what the codes actually
+    # correspond to), not the chunk's original text, when both are present.
+    speak_gen = object.__new__(Generator)
+    speak_gen._rolling = None
+    speak_gen._accept_rolling({
+        "id": "ch01:p0003:s0000", "paragraph_index": 3, "chapter": "ch01",
+        "text": "Abbas I, the fifth Safavid shah.",
+        "speak_text": "Abbas the First, the fifth Safavid shah.",
+        "_gen_codes": "codes-obj",
+    })
+    check("rolling context text is speak_text, not the original chunk text",
+          speak_gen._rolling["text"] == "Abbas the First, the fifth Safavid shah.")
+
+    # v31 plan-identity trap: normalize_for_tts must never reach chunk id,
+    # text_sha256, or anything build_plan/_child_chunks hash -- those stay
+    # bound to the untouched original text, or a chapter's existing
+    # state.json plan would mismatch the moment this shipped (the same
+    # trap as the --chapters incident this session already hit once).
+    _regnal_text = "However, the accession of Abbas I, the fifth Safavid shah."
+    _regnal_chunk = _test_chunk("ch02:p0055:s0000-0001", _regnal_text, [0, len(_regnal_text)], _span_a)
+    check("plan-identity fields (id/text_sha256) are untouched by normalize_for_tts",
+          _regnal_chunk["text"] == _regnal_text
+          and _regnal_chunk["text_sha256"] == sha256_text(_regnal_text)
+          and _regnal_chunk["text_sha256"] != sha256_text(asr.normalize_for_tts(_regnal_text)))
 
     failed = [name for name, ok in results if not ok]
     print(f"selfcheck: {len(results) - len(failed)}/{len(results)} passed")

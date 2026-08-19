@@ -67,7 +67,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v30-cracow-krakow-pair"
+VALIDATION_POLICY = "paragraph-v31-regnal-numeral-speak-text"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -449,6 +449,91 @@ def tokenize_variants(text: str) -> list:
         return [default, compound]
     return [default]
 
+
+# --- speak-time text normalization (v31) -------------------------------------
+# A bare capital roman numeral immediately after a name ("Abbas I,") is a
+# real TTS mispronunciation hazard, not an ASR/gate equivalence problem --
+# traced from ch02:p0055 ("Abbas I, the fifth Safavid shah"): the TTS
+# rendered a short, unrelated syllable ("V") in both draws where "the
+# First" needs roughly 6-7x longer, confirmed by word-timestamp duration
+# (0.26s where "the First, the fifth" needs ~1.5-2s of speech) and by
+# re-transcribing an isolated clip with no surrounding sentence context
+# (still heard the same short "V" with high confidence, not the longer
+# phrase Whisper's own language model would need to normalize away).
+#
+# normalize_for_tts rewrites this ONE hazard -- "Name/War/Part + roman
+# numeral" -- into the word actually meant to be spoken, before the text
+# reaches the TTS. It is not a general text normalizer: nothing else about
+# the sentence changes.
+_ROMAN_TO_ORDINAL = {
+    "I": "First", "II": "Second", "III": "Third", "IV": "Fourth", "V": "Fifth",
+    "VI": "Sixth", "VII": "Seventh", "VIII": "Eighth", "IX": "Ninth", "X": "Tenth",
+}
+_ROMAN_TO_CARDINAL = {
+    "I": "One", "II": "Two", "III": "Three", "IV": "Four", "V": "Five",
+    "VI": "Six", "VII": "Seven", "VIII": "Eight", "IX": "Nine", "X": "Ten",
+}
+# After one of these words, a roman numeral is a count, not a regnal
+# ordinal: "World War II" = "World War Two", not "...the Second"; "Part
+# III" = "Part Three".
+_CARDINAL_CONTEXT_WORDS = frozenset({"War", "Part", "Chapter", "Volume", "Book", "Act"})
+
+_REGNAL_NUMERAL_RE = re.compile(
+    r"\b([A-Z][a-zA-Z]*)\s+(I|II|III|IV|V|VI|VII|VIII|IX|X)\b([.,;:]?)"
+)
+
+
+def normalize_for_tts(text: str) -> str:
+    """Speak-time-only substitution for the "Name/War/Part + roman numeral"
+    hazard (see module comment above). NEVER changes plan identity, chunk
+    ids, or text_sha256 -- callers apply this only at the point text is
+    handed to the TTS, and symmetrically as the ASR comparison's expected
+    text (that is what was actually spoken); the chunk's own `text` field
+    stays the untouched original everywhere else (plan hashing,
+    `derive_mandatory`, state.json).
+
+    Two readings of "Word + roman numeral":
+    - Regnal ordinal (default): "Abbas I" -> "Abbas the First", "Suleiman
+      II" -> "Suleiman the Second".
+    - Cardinal count, when the preceding word is in the fixed exclusion
+      list (_CARDINAL_CONTEXT_WORDS): "World War II" -> "World War Two",
+      "Part III" -> "Part Three" -- English reads these as counts, not
+      regnal ordinals.
+
+    "I" specifically only fires when immediately followed by punctuation
+    (comma/period/semicolon/colon): a bare "I" collides with the
+    first-person pronoun ("Mary I know" has no punctuation after "I" and
+    is left alone), but "Abbas I," or "Abbas I." is unambiguous. II-X have
+    no such collision and fire on the pattern alone.
+    """
+    def repl(m):
+        word, numeral, punct = m.group(1), m.group(2), m.group(3)
+        if numeral == "I" and not punct:
+            return m.group(0)
+        cardinal = word in _CARDINAL_CONTEXT_WORDS
+        table = _ROMAN_TO_CARDINAL if cardinal else _ROMAN_TO_ORDINAL
+        prefix = "" if cardinal else "the "
+        return f"{word} {prefix}{table[numeral]}{punct}"
+
+    return _REGNAL_NUMERAL_RE.sub(repl, text)
+
+
+# Roman-numeral <-> spoken-ordinal equivalence: normalize_for_tts rewrites
+# "Abbas I," to "Abbas the First," before synthesis, but Whisper's own
+# transcription may renormalize spoken "the First" straight back to the
+# roman-numeral shorthand "I" (or the digit-ordinal "1st"), the same way it
+# renormalizes any other spoken ordinal. Scoped to exactly the I-X set
+# normalize_for_tts rewrites; matched and substituted as a whole phrase via
+# the same _apply_phrase_pairs machinery as _TRANSLITERATION_PHRASE_PAIRS,
+# so "the 1st" only ever equates to "i"/"1st" here, never a bare "first"
+# floating anywhere else in the text.
+_REGNAL_NUMERAL_PHRASE_PAIRS = tuple(
+    (("the", digit_ordinal), (roman.lower(),), (digit_ordinal,))
+    for roman, digit_ordinal in (
+        ("I", "1st"), ("II", "2nd"), ("III", "3rd"), ("IV", "4th"), ("V", "5th"),
+        ("VI", "6th"), ("VII", "7th"), ("VIII", "8th"), ("IX", "9th"), ("X", "10th"),
+    )
+)
 
 
 
@@ -857,28 +942,50 @@ _TRANSLITERATION_PHRASE_PAIRS = (
 
 def _apply_phrase_pairs(expected: list, asr: list) -> tuple:
     """Rewrite `expected` so a curated phrase-pair variant (see
-    `_TRANSLITERATION_PHRASE_PAIRS`) actually present in `asr` replaces the
-    source's own spelling of that phrase. Returns (rewritten_expected,
-    fired) where `fired` maps the source phrase to the transcript phrase
-    it was aligned to, for the morning audit."""
-    out = list(expected)
+    `_TRANSLITERATION_PHRASE_PAIRS` and `_REGNAL_NUMERAL_PHRASE_PAIRS`)
+    actually present in `asr` replaces the source's own spelling of that
+    phrase. Returns (rewritten_expected, fired) where `fired` maps the
+    source phrase to the transcript phrase it was aligned to, for the
+    morning audit.
+
+    A single forward pass over the ORIGINAL `expected` list, never
+    re-reading its own output: some groups pair variants of different
+    lengths where one is a token-subset of another (the regnal-numeral
+    group has both "the 1st" and bare "1st"), so a naive repeated
+    whole-list rewrite can match a span it just wrote and re-substitute it
+    forever. Reading only from the untouched original and advancing past
+    whatever was matched makes that impossible -- the scan position is
+    monotonic and bounded by len(expected).
+    """
+    all_pairs = _TRANSLITERATION_PHRASE_PAIRS + _REGNAL_NUMERAL_PHRASE_PAIRS
+    out = []
     fired = {}
-    for variants in _TRANSLITERATION_PHRASE_PAIRS:
-        for variant in variants:
-            n = len(variant)
-            i = 0
-            while i + n <= len(out):
-                if tuple(out[i:i + n]) == variant:
-                    for alt in variants:
-                        if alt == variant:
-                            continue
-                        m = len(alt)
-                        if any(tuple(asr[j:j + m]) == alt
-                               for j in range(len(asr) - m + 1)):
-                            out[i:i + n] = list(alt)
-                            fired[" ".join(variant)] = " ".join(alt)
-                            break
-                i += 1
+    i = 0
+    n_exp = len(expected)
+    while i < n_exp:
+        matched = False
+        for variants in all_pairs:
+            for variant in variants:
+                n = len(variant)
+                if tuple(expected[i:i + n]) != variant:
+                    continue
+                for alt in variants:
+                    if alt == variant:
+                        continue
+                    m = len(alt)
+                    if any(tuple(asr[j:j + m]) == alt for j in range(len(asr) - m + 1)):
+                        out.extend(alt)
+                        fired[" ".join(variant)] = " ".join(alt)
+                        i += n
+                        matched = True
+                        break
+                if matched:
+                    break
+            if matched:
+                break
+        if not matched:
+            out.append(expected[i])
+            i += 1
     return out, fired
 
 
@@ -2480,6 +2587,54 @@ def selfcheck() -> int:
     }
     check("cache key separates all params",
           base not in variants and len(variants) == 6)
+
+    # v31: speak-time text normalization for the "Name + roman numeral"
+    # mispronunciation hazard (see normalize_for_tts's docstring -- traced
+    # from ch02:p0055, "Abbas I," rendered as a short unrelated syllable).
+    abbas_source = ("However, the accession of Abbas I, the fifth Safavid "
+                    "shah, in fifteen eighty-seven marked the onset of a "
+                    "political revolution.")
+    abbas_speak = normalize_for_tts(abbas_source)
+    check("Abbas I becomes Abbas the First in speak_text",
+          "Abbas the First," in abbas_speak and "Abbas I," not in abbas_speak,
+          repr(abbas_speak))
+    for abbas_transcript in (
+        "However, the accession of Abbas the First, the fifth Safavid "
+        "Shah, in 1587, marked the onset of a political revolution.",
+        "However, the accession of Abbas I, the fifth Safavid Shah, in "
+        "1587, marked the onset of a political revolution.",
+    ):
+        abbas_exp = tokenize(abbas_speak)
+        abbas_asr = tokenize(abbas_transcript)
+        abbas_mand = derive_mandatory(abbas_exp, abbas_speak)
+        abbas_mres = check_mandatory(abbas_asr, abbas_mand)
+        abbas_cov = ordered_coverage(abbas_exp, abbas_asr, abbas_mres["phonetic_matches"])
+        abbas_term = terminal_suffix(abbas_exp, abbas_asr,
+                                     phonetic_matches=abbas_mres["phonetic_matches"])
+        check(f"Abbas sentence validates end-to-end against {abbas_transcript[-30:]!r}",
+              abbas_mres["missing"] == [] and abbas_cov["missing"] == [] and
+              abbas_term["matched"],
+              repr((abbas_mres["missing"], abbas_cov["missing"], abbas_term)))
+    check("Suleiman II becomes Suleiman the Second",
+          normalize_for_tts("Suleiman II succeeded his father.") ==
+          "Suleiman the Second succeeded his father.")
+    check("World War II becomes World War Two (cardinal exclusion list)",
+          normalize_for_tts("World War II reshaped the continent.") ==
+          "World War Two reshaped the continent.")
+    check("Part III becomes Part Three (cardinal exclusion list)",
+          normalize_for_tts("Part III covers the aftermath.") ==
+          "Part Three covers the aftermath.")
+    check("pronoun guard: 'Mary I know' unchanged (no punctuation after I)",
+          normalize_for_tts("Mary I know is not the same person.") ==
+          "Mary I know is not the same person.")
+    check("pronoun guard: '...and I said' unchanged",
+          normalize_for_tts("...and I said nothing at all.") ==
+          "...and I said nothing at all.")
+    check("plain text with no numerals is byte-identical",
+          normalize_for_tts("The death of Tamerlane in 1405.") ==
+          "The death of Tamerlane in 1405.")
+    check("bare 'I.' after a name still fires (punctuation present)",
+          normalize_for_tts("Meet Agent I.") == "Meet Agent the First.")
 
     try:
         import numpy as np  # noqa: F401
