@@ -1559,9 +1559,6 @@ class Generator:
                 return False
         return True
 
-    def _all_done(self) -> bool:
-        return self._plan_complete()
-
     # -- release gate ---------------------------------------------------------
     @staticmethod
     def _record_ok(rec, text_sha256: str, wav_sha256: str,
@@ -1614,6 +1611,42 @@ class Generator:
                                    self.config.asr_repo, self.config.asr_revision):
                 blocked.append(parent["id"])
         return {"release": not blocked, "blocked": blocked}
+
+    def _assembly_decision(self) -> dict:
+        """The single gate both `run()` (generate) and `validate_generated`
+        consult before touching book.wav -- consistent by construction,
+        since there is only one implementation to consult.
+
+        `self.failed` is checked FIRST, before plan completeness: a parent
+        chunk can be "done" as one whole unit while `self.failed` still
+        holds a genuine failure for a different id, and `_plan_complete`/
+        `_release_gate` only ever look at `self.done`, so neither would
+        ever see that failure on its own. (A stale clause-split-child
+        entry left behind by a later whole-parent regeneration is not this
+        case -- that is reconciled out of `self.failed` the moment the
+        parent completes; see `_clear_resolved_failures`. What is left in
+        `self.failed` by the time this runs is always a real, unresolved
+        failure.)
+
+        Returns one of:
+        - ``{"status": "empty"}``: nothing planned.
+        - ``{"status": "failed", "failed_ids": [...]}``: refuse -- resolve
+          the continue-on-failure set before assembly.
+        - ``{"status": "incomplete"}``: refuse -- generation still pending.
+        - ``{"status": "blocked", "blocked": [...]}``: refuse -- every unit
+          is done, but a validation record does not check out.
+        - ``{"status": "release"}``: safe to concatenate.
+        """
+        if not self.plan["chunks"]:
+            return {"status": "empty"}
+        if self.failed:
+            return {"status": "failed", "failed_ids": sorted(self.failed)}
+        if not self._plan_complete():
+            return {"status": "incomplete"}
+        gate = self._release_gate()
+        if not gate["release"]:
+            return {"status": "blocked", "blocked": gate["blocked"]}
+        return {"status": "release"}
 
     def _remove_book_artifacts(self) -> None:
         """Delete stale final book artifacts so an old book cannot masquerade
@@ -1818,26 +1851,31 @@ class Generator:
             "audio_seconds": round(audio_cum, 2),
             "load_seconds": round(self.load_seconds, 2) if self.load_seconds is not None else None,
         }
-        if self.plan["chunks"] and self._all_done():
-            gate = self._release_gate()
-            if gate["release"]:
-                concat = self._concatenate()
-                print(f"  concatenated {len(concat['chapters'])} chapters -> {self.out_dir / BOOK_WAV_REL} ({concat['seconds']:.1f}s audio)")
-                summary["book"] = concat
-            else:
-                self._remove_book_artifacts()
-                summary["book"] = None
-                summary["blocked"] = gate["blocked"]
-        elif self.plan["chunks"] and self.failed:
+        # One gate for both entry points (see _assembly_decision):
+        # generate and validate now refuse identically, and for the same
+        # reason, whenever a real failure is unresolved.
+        decision = self._assembly_decision()
+        if decision["status"] == "release":
+            concat = self._concatenate()
+            print(f"  concatenated {len(concat['chapters'])} chapters -> {self.out_dir / BOOK_WAV_REL} ({concat['seconds']:.1f}s audio)")
+            summary["book"] = concat
+        elif decision["status"] == "failed":
             # Loud, explicit: a non-empty failed set means real content is
-            # missing from the book, never silently -- distinct from the
-            # ordinary "still generating" case below.
-            print(f"  book.wav not built: {len(self.failed)} chunk(s) PERMANENTLY FAILED "
+            # missing from the book, never silently.
+            self._remove_book_artifacts()
+            summary["book"] = None
+            summary["blocked"] = decision["failed_ids"]
+            print(f"  book.wav not built: {len(decision['failed_ids'])} chunk(s) PERMANENTLY FAILED "
                   "(continue-on-failure mode) -- resolve before assembly:", file=sys.stderr)
-            for cid, entry in sorted(self.failed.items()):
+            for cid in decision["failed_ids"]:
+                entry = self.failed[cid]
                 reason = entry["reasons"][-1] if entry.get("reasons") else "no diagnostic available"
                 print(f"    {cid}: {reason}", file=sys.stderr)
-        elif self.plan["chunks"]:
+        elif decision["status"] == "blocked":
+            self._remove_book_artifacts()
+            summary["book"] = None
+            summary["blocked"] = decision["blocked"]
+        elif decision["status"] == "incomplete":
             print("  book.wav not built: plan incomplete; re-run to resume")
         return summary
 
@@ -1929,20 +1967,28 @@ def validate_generated(root, out_dir, *, chapters=None, limit=None, config=None)
     # the same done set. Loads no model.
     g = Generator(root, out_dir, config=cfg, chapters=chapters, limit=limit)
     result["failed_chunks"] = sorted(g.failed)
-    if failed or g.failed:
-        # Refuse, loudly: a non-empty continue-on-failure set means real
-        # sentences are missing from the book, never a silent gap.
-        if g.failed:
+    if failed:
+        # A fresh ASR failure from THIS validate pass, separate from
+        # `g.failed` (the persisted continue-on-failure set) -- either one
+        # alone means real content is not safe to release, so this check
+        # stays independent of `g._assembly_decision()` below.
+        pass
+    else:
+        # Same gate `generate` uses (see Generator._assembly_decision):
+        # refuses identically, and for the same reason, whenever a real
+        # failure is unresolved.
+        decision = g._assembly_decision()
+        if decision["status"] == "failed":
             result["book_blocked_reason"] = (
-                f"{len(g.failed)} chunk(s) in the continue-on-failure set; "
+                f"{len(decision['failed_ids'])} chunk(s) in the continue-on-failure set; "
                 "resolve (fix + revalidate, or adjudicate) before assembly")
-    elif g._plan_complete() and g._release_gate()["release"]:
-        book = g._concatenate()
-        result["book"] = {
-            "wav": BOOK_WAV_REL,
-            "seconds": book["seconds"],
-            "chapters": len(book["chapters"]),
-        }
+        elif decision["status"] == "release":
+            book = g._concatenate()
+            result["book"] = {
+                "wav": BOOK_WAV_REL,
+                "seconds": book["seconds"],
+                "chapters": len(book["chapters"]),
+            }
     return result
 
 
@@ -2475,6 +2521,53 @@ def selfcheck() -> int:
                                             "omitted": True, "omit_reason": "OMIT_UNSPEAKABLE"}}
         check("release gate does not block an omitted unit",
               gate_gen._release_gate() == {"release": True, "blocked": []})
+
+        # _assembly_decision (defect 2's shared gate): empty plan, a
+        # complete+passing plan, and a complete-but-blocked plan each
+        # report the status run()/validate_generated act on.
+        gate_gen.failed = {}
+        check("assembly decision releases when the plan is complete, gate passes, nothing failed",
+              gate_gen._assembly_decision() == {"status": "release"})
+        empty_gen = object.__new__(Generator)
+        empty_gen.plan = {"chunks": []}
+        check("assembly decision reports empty for a plan with nothing in it",
+              empty_gen._assembly_decision() == {"status": "empty"})
+        incomplete_chunk = {"id": "ch01:p0008:s0000-0001", "text": "Not generated yet.",
+                            "text_sha256": sha256_text("Not generated yet."),
+                            "eligible_clause_spans": []}
+        incomplete_gen = object.__new__(Generator)
+        incomplete_gen.plan = {"chunks": [incomplete_chunk]}
+        incomplete_gen.done = {}
+        incomplete_gen.failed = {}
+        check("assembly decision reports incomplete while a unit is still pending (no failure)",
+              incomplete_gen._assembly_decision() == {"status": "incomplete"})
+        blocked_chunk = {"id": "ch01:p0009:s0000-0001", "text": "Done but unrecorded.",
+                         "text_sha256": sha256_text("Done but unrecorded."),
+                         "eligible_clause_spans": []}
+        blocked_wav = td / "blocked.wav"
+        _make_wav(blocked_wav, [1, 2])
+        blocked_gen = object.__new__(Generator)
+        blocked_gen.out_dir = td
+        blocked_gen.validate = True
+        # A record that PASSes (so _unit_done/_plan_complete count this
+        # chunk as generation-complete) but under a stale validation
+        # policy -- _record_ok's stricter check (used only by
+        # _release_gate) catches that and blocks release.
+        blocked_gen._records = {blocked_chunk["id"]: dict(
+            _pass, chunk_id=blocked_chunk["id"], wav_sha256=sha256_file(blocked_wav),
+            expected_sha256=Generator._expected_text_sha256(blocked_chunk),
+            validation_policy="stale-policy",
+        )}
+        blocked_gen.config = type("Cfg", (), {"asr_repo": _ar, "asr_revision": _av})()
+        blocked_gen.plan = {"chunks": [blocked_chunk]}
+        blocked_gen.done = {blocked_chunk["id"]: {
+            "text_sha256": blocked_chunk["text_sha256"], "wav": blocked_wav.name,
+            "wav_sha256": sha256_file(blocked_wav), "samples": 2,
+            "terminal_silence_seconds": 0.0,
+        }}
+        blocked_gen.failed = {}
+        check("assembly decision reports blocked when the plan is complete but a record fails the gate",
+              blocked_gen._assembly_decision() == {"status": "blocked", "blocked": [blocked_chunk["id"]]})
 
     # Assembly must skip an omitted unit's audio entirely -- the real
     # neighbors on either side get exactly the padding their own paragraph
@@ -3092,9 +3185,52 @@ def selfcheck() -> int:
     check("assembly refuses (plan incomplete) while a chunk is in the failed set",
           not refuse_gen._plan_complete())
 
+    # 4b. Defect 2 (inconsistent assembly gating): _assembly_decision is
+    # the ONE gate both `run()` and `validate_generated` now consult, and
+    # it must refuse -- listing the failing id(s), like `validate` always
+    # has -- for a real failure alone, with no `done` entries in play at
+    # all (nothing for _plan_complete/_release_gate to even look at).
+    refuse_gen.config = type("Cfg", (), {"asr_repo": "a-repo", "asr_revision": "a-rev"})()
+    refuse_gen._records = {}
+    check("_assembly_decision refuses generate/validate identically while a real failure exists, "
+          "listing the failing id",
+          refuse_gen._assembly_decision() == {"status": "failed", "failed_ids": [rchunk["id"]]})
+
+    # 4c. The gap defect 2 actually closes: a parent regenerated whole and
+    # DONE, with a stale failed entry that (hypothetically) survived
+    # cleanup -- e.g. a hand-edited state.json, or a future code path that
+    # forgets to call _clear_resolved_failures. _plan_complete/
+    # _release_gate only ever look at self.done, so THEY alone would call
+    # this releasable; _assembly_decision checks self.failed first and
+    # still refuses. In the live directory, normal operation never reaches
+    # this state -- _clear_resolved_failures (4d/4e below) clears the
+    # entry the moment the parent completes -- but the assembly gate does
+    # not rely on that alone.
     _dd_parent = dict(_ca, eligible_clause_spans=[_span_a, _span_b])
     _dd_helper = object.__new__(Generator)
     _dd_child = _dd_helper._child_chunks(_dd_parent)[0]
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        dd_wav = td / "dd-parent.wav"
+        _make_wav(dd_wav, [1, 2, 3])
+        dd_gen = object.__new__(Generator)
+        dd_gen.out_dir = td
+        dd_gen.validate = False
+        dd_gen.plan = {"chunks": [_dd_parent]}
+        dd_gen.done = {_dd_parent["id"]: {
+            "text_sha256": _dd_parent["text_sha256"], "wav": dd_wav.name,
+            "wav_sha256": sha256_file(dd_wav), "samples": 3,
+            "terminal_silence_seconds": 0.0,
+        }}
+        dd_gen.failed = {_dd_child["id"]: {
+            "text_sha256": _dd_child["text_sha256"], "reasons": ["stale, survived cleanup"],
+        }}
+        dd_gen._records = {}
+        dd_gen.config = type("Cfg", (), {"asr_repo": "a-repo", "asr_revision": "a-rev"})()
+        check("_plan_complete alone would wrongly call this releasable (the gap defect 2 closes)",
+              dd_gen._plan_complete())
+        check("_assembly_decision still refuses even though _plan_complete is True",
+              dd_gen._assembly_decision() == {"status": "failed", "failed_ids": [_dd_child["id"]]})
 
     # 4d. Defect 1 (stale orphaned child): the actual production shape --
     # a chunk was clause-split, one child exhausted its retry budget and
