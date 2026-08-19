@@ -67,7 +67,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v29-ambiguous-number-variants"
+VALIDATION_POLICY = "paragraph-v30-cracow-krakow-pair"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -779,10 +779,18 @@ def _is_vowel_swap(a: str, b: str) -> bool:
 # are not interchangeable here); khalifa/caliph(ate) (person vs.
 # institution, not a spelling variant); Tamerlane/Timur (an epithet vs. a
 # given name, not a transliteration pair).
+#
+# ch02: "Cracow" (source spelling, the traditional English exonym) /
+# "Krakow" (transcript, the modern standard English spelling) name the
+# same Polish city -- consonant substitution (c/k twice), below the
+# general fuzzy-ratio floor (0.667 < 0.8) and not a vowel swap, so neither
+# existing mechanism reaches it; both draws rendered it identically, the
+# only miss in an otherwise content-correct transcript.
 _TRANSLITERATION_PAIRS = frozenset({
     frozenset({"koran", "quran"}),
     frozenset({"koranic", "quranic"}),
     frozenset({"genghis", "chinggis"}),
+    frozenset({"cracow", "krakow"}),
 })
 
 
@@ -2193,6 +2201,16 @@ def selfcheck() -> int:
           _is_transliteration_pair("koranic", "quranic"))
     check("genghis matches its transliteration variant chinggis",
           _is_transliteration_pair("genghis", "chinggis"))
+    check("cracow matches its transliteration variant krakow",
+          _is_transliteration_pair("cracow", "krakow"))
+    cracow_mandatory = check_mandatory(
+        tokenize("the first book was printed in Krakow in 1423."),
+        derive_mandatory(tokenize("the first book was printed in Cracow in fourteen twenty-three."),
+                         "the first book was printed in Cracow in fourteen twenty-three."))
+    check("cracow/krakow is not hard-mandatory and is recorded for the morning audit",
+          cracow_mandatory["missing"] == [] and
+          cracow_mandatory["transliteration_matches"].get("cracow") == "krakow",
+          repr(cracow_mandatory))
     check("an unrelated word is not a curated transliteration pair",
           not _is_transliteration_pair("koran", "random") and
           not _tok_eq("koran", "random", MANDATORY_FUZZY_RATIO))
