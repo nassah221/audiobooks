@@ -518,16 +518,69 @@ def _fix_text_defects(text: str) -> str:
     return text
 
 
+# Recognized here rather than a bare "c.": epub.py's expand_numbers has
+# already turned any year into number words by the time normalize_for_tts
+# sees it ("1750" -> "seventeen fifty", "1500" -> "fifteen hundred"), so
+# the number-word run after "c." only ever draws from _NUM_WORDS plus
+# these two scale words.
+_CIRCA_NUMBER_WORDS = frozenset(_NUM_WORDS) | {"hundred", "thousand", "oh"}
+_CIRCA_HEAD_RE = re.compile(r"\bc\.[ ]?")
+_CIRCA_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def _rewrite_circa(text: str) -> str:
+    """Rewrite "c." immediately before a number -- glued ("c.1750", already
+    "c.seventeen fifty" by the time this runs) or spaced ("c. 1870") -- into
+    "circa <number>", one pattern covering both forms.
+
+    That is how a narrator actually reads "c." before a date: forensics on
+    three already-generated chapter-1 takes show it was NEVER read as
+    "circa" as things stand -- Whisper heard "sea, 1870", "C-1800", and
+    "C1350" for the three spaced occurrences, all silently accepted
+    because the merged year digits alone still satisfied the lexical
+    gates. ch02:p0069's glued "c.1750" failed outright, dropping the
+    reading to bare "1750" with no trace of "c" at all.
+
+    The number-word context is the guard: "c." only rewrites when
+    IMMEDIATELY followed (optionally through one space) by a run of
+    number words (_CIRCA_NUMBER_WORDS) -- a sentence-final "c." or any
+    other use is untouched, since nothing recognizable as a number
+    follows it.
+    """
+    out = []
+    last = 0
+    for m in _CIRCA_HEAD_RE.finditer(text):
+        if m.start() < last:
+            continue
+        pos = m.end()
+        wm = _CIRCA_WORD_RE.match(text, pos)
+        if not wm or wm.group(0).lower() not in _CIRCA_NUMBER_WORDS:
+            continue
+        words = [wm.group(0)]
+        pos = wm.end()
+        while pos < len(text) and text[pos] == " ":
+            wm2 = _CIRCA_WORD_RE.match(text, pos + 1)
+            if not wm2 or wm2.group(0).lower() not in _CIRCA_NUMBER_WORDS:
+                break
+            words.append(wm2.group(0))
+            pos = wm2.end()
+        out.append(text[last:m.start()])
+        out.append("circa " + " ".join(words))
+        last = pos
+    out.append(text[last:])
+    return "".join(out)
+
+
 def normalize_for_tts(text: str) -> str:
-    """Speak-time-only substitution for two hazards: known publisher-EPUB
-    text defects (_TEXT_DEFECT_FIXES, exact strings), and the "Name/War/
-    Part + roman numeral" mispronunciation hazard (see module comment
-    above). NEVER changes plan identity, chunk ids, or text_sha256 --
-    callers apply this only at the point text is handed to the TTS, and
-    symmetrically as the ASR comparison's expected text (that is what was
-    actually spoken); the chunk's own `text` field stays the untouched
-    original everywhere else (plan hashing, `derive_mandatory`,
-    state.json).
+    """Speak-time-only substitution for three hazards: known publisher-EPUB
+    text defects (_TEXT_DEFECT_FIXES, exact strings), "c." before a number
+    (_rewrite_circa), and the "Name/War/Part + roman numeral"
+    mispronunciation hazard (see module comment above). NEVER changes plan
+    identity, chunk ids, or text_sha256 -- callers apply this only at the
+    point text is handed to the TTS, and symmetrically as the ASR
+    comparison's expected text (that is what was actually spoken); the
+    chunk's own `text` field stays the untouched original everywhere else
+    (plan hashing, `derive_mandatory`, state.json).
 
     Two readings of "Word + roman numeral":
     - Regnal ordinal (default): "Abbas I" -> "Abbas the First", "Suleiman
@@ -547,6 +600,7 @@ def normalize_for_tts(text: str) -> str:
     fire on the pattern alone.
     """
     text = _fix_text_defects(text)
+    text = _rewrite_circa(text)
 
     def repl(m):
         word, numeral, punct = m.group(1), m.group(2), m.group(3)
@@ -2966,6 +3020,31 @@ def selfcheck() -> int:
     check("text without the defect is byte-identical",
           normalize_for_tts("The death of Tamerlane in 1405.") ==
           "The death of Tamerlane in 1405.")
+
+    # "c." before a number reads as "circa" (both glued and spaced forms,
+    # one pattern) -- forensics on three already-generated chapter-1 takes
+    # showed it was NEVER read as "circa" as things stand ("sea, 1870",
+    # "C-1800", "C1350"), and ch02:p0069's glued form dropped the reading
+    # to bare "1750" outright and failed validation. The number-word
+    # context is the guard: no number after "c." (sentence-final, or a
+    # list marker like "c. cherries") leaves it untouched.
+    check("glued 'c.1750' (as expand_numbers renders it) becomes 'circa seventeen fifty'",
+          normalize_for_tts("South China after c.seventeen fifty.") ==
+          "South China after circa seventeen fifty.")
+    check("spaced 'c. 1870' (as expand_numbers renders it) becomes 'circa eighteen seventy'",
+          normalize_for_tts("After c. eighteen seventy fear spread.") ==
+          "After circa eighteen seventy fear spread.")
+    check("'hundred' scale words are covered too (c. 1500 -> fifteen hundred)",
+          normalize_for_tts("Until c. fifteen hundred trade grew.") ==
+          "Until circa fifteen hundred trade grew.")
+    check("a bare 'c.' not followed by a number is unchanged (sentence-final)",
+          normalize_for_tts("His work ended with c.") == "His work ended with c.")
+    check("a bare 'c.' not followed by a number is unchanged (list marker)",
+          normalize_for_tts("The list included a. apples, b. bananas, c. cherries.") ==
+          "The list included a. apples, b. bananas, c. cherries.")
+    check("plain text with no 'c.' is byte-identical",
+          normalize_for_tts("A sentence with no abbreviations at all.") ==
+          "A sentence with no abbreviations at all.")
 
     try:
         import numpy as np  # noqa: F401
