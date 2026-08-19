@@ -66,7 +66,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v24-possessive-hyphen-phrase"
+VALIDATION_POLICY = "paragraph-v25-phonetic-match-propagation"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -576,8 +576,22 @@ def normalize(text: str) -> str:
     return " ".join(tokenize(text))
 
 
+def _apply_phonetic_matches(tokens: list, phonetic_matches: dict) -> list:
+    """Substitute a source token the mandatory gate already demoted via
+    v12's phonetic-match machinery (`_find_phonetic_match`) with its
+    recorded transcript counterpart. This is not a new fuzzy comparison --
+    the match was already made and recorded in `phonetic_matches`
+    (mandatory.phonetic_matches); this just stops coverage/terminal from
+    contradicting that conclusion with a second, stricter verdict on the
+    same evidence. A token with no recorded match is left untouched, so
+    this can only turn a would-be miss into a match, never the reverse."""
+    if not phonetic_matches:
+        return tokens
+    return [phonetic_matches.get(tok, tok) for tok in tokens]
+
+
 # --- alignment metrics -------------------------------------------------------
-def ordered_coverage(expected: list, asr: list) -> dict:
+def ordered_coverage(expected: list, asr: list, phonetic_matches: dict = None) -> dict:
     """Maximum ordered token coverage of expected in ASR tokens (LCS).
 
     A token of `expected` is matched if the expected tokens form a
@@ -586,11 +600,14 @@ def ordered_coverage(expected: list, asr: list) -> dict:
     itself, never the tokens after it. O(len(expected) * len(asr)) — trivial
     at sentence scale.
 
-    Both lists are first reconciled across hyphen/compound-word boundaries
-    (`_reconcile_concat_boundaries`): a token-boundary difference like
-    "waste lands" / "wastelands" is orthography-only, so it must not cost
-    a match here any more than it does in the mandatory-word gate.
+    `expected` first has any recorded phonetic matches substituted in
+    (`_apply_phonetic_matches`), then both lists are reconciled across
+    hyphen/compound-word boundaries (`_reconcile_concat_boundaries`): a
+    token-boundary difference like "waste lands" / "wastelands" is
+    orthography-only, so it must not cost a match here any more than it
+    does in the mandatory-word gate.
     """
+    expected = _apply_phonetic_matches(expected, phonetic_matches)
     expected, asr = _reconcile_concat_boundaries(expected, asr)
     n, m = len(expected), len(asr)
     dp = [[0] * (m + 1) for _ in range(n + 1)]
@@ -942,14 +959,17 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
             "vowel_matches": vowel_matches, "transliteration_matches": transliteration_matches}
 
 
-def terminal_suffix(expected: list, asr: list, size: int = 5) -> dict:
+def terminal_suffix(expected: list, asr: list, size: int = 5, phonetic_matches: dict = None) -> dict:
     """Require the final expected phrase near the end of the transcript.
 
-    Reconciled across hyphen/compound-word boundaries first, same as
-    `ordered_coverage`, so a tail like "waste lands were colonized" matches
-    a transcript ending "wastelands were colonised" -- the reported
-    `expected` phrase reflects the reconciled tail actually checked.
+    Phonetic matches already recorded by the mandatory gate are substituted
+    in first (`_apply_phonetic_matches`), then both are reconciled across
+    hyphen/compound-word boundaries, same as `ordered_coverage`, so a tail
+    like "waste lands were colonized" matches a transcript ending
+    "wastelands were colonised" -- the reported `expected` phrase reflects
+    the reconciled tail actually checked.
     """
+    expected = _apply_phonetic_matches(expected, phonetic_matches)
     r_expected, r_asr = _reconcile_concat_boundaries(expected, asr)
     tail = r_expected[-size:]
     window = r_asr[-(len(tail) + 2):]
@@ -1361,10 +1381,12 @@ class AsrValidator:
         expected_tokens = tokenize(expected_text)
         word_timings = normalized_word_timings(segments)
         mand_items = derive_mandatory(expected_tokens, expected_text) if mandatory is None else mandatory
+        mandatory_result = check_mandatory(asr_tokens, mand_items)
+        phonetic_matches = mandatory_result.get("phonetic_matches")
         metrics = {
-            "coverage": ordered_coverage(expected_tokens, asr_tokens),
-            "mandatory": check_mandatory(asr_tokens, mand_items),
-            "terminal": terminal_suffix(expected_tokens, asr_tokens),
+            "coverage": ordered_coverage(expected_tokens, asr_tokens, phonetic_matches),
+            "mandatory": mandatory_result,
+            "terminal": terminal_suffix(expected_tokens, asr_tokens, phonetic_matches=phonetic_matches),
             "confidence": _confidence(segments),
             "repetition": repetition_stats(asr_tokens, expected_tokens),
             "leakage": leakage_check(asr_tokens, leakage_texts or []),
@@ -1724,6 +1746,43 @@ def selfcheck() -> int:
     check("europe swapped for the unrelated erode stays hard-mandatory",
           check_mandatory(tokenize("the attempt to decentre erode entirely"),
                           ["europe"])["missing"] == ["europe"])
+
+    # v25: coverage/terminal must not contradict a phonetic match the
+    # mandatory gate already made and recorded -- no new fuzzy comparison,
+    # just not re-litigating the same evidence with a stricter verdict.
+    # "Cannalore" (fifteen oh five) and Goa (fifteen ten)." is short enough
+    # that one garbled rare name alone drops coverage under 0.85 and blanks
+    # the terminal phrase, even though the mandatory gate already accepted it.
+    cannalore_expected = tokenize("Cannalore (fifteen oh five) and Goa (fifteen ten).")
+    for cannalore_transcript in ("Canelor 1505 and Goa 1510.", "Canelaw 1505 and Goa 1510."):
+        cannalore_asr = tokenize(cannalore_transcript)
+        cannalore_mand = derive_mandatory(cannalore_expected,
+                                          "Cannalore (fifteen oh five) and Goa (fifteen ten).")
+        cannalore_result = check_mandatory(cannalore_asr, cannalore_mand)
+        cannalore_pm = cannalore_result["phonetic_matches"]
+        cannalore_cov = ordered_coverage(cannalore_expected, cannalore_asr, cannalore_pm)
+        cannalore_term = terminal_suffix(cannalore_expected, cannalore_asr,
+                                         phonetic_matches=cannalore_pm)
+        check(f"Cannalore/{cannalore_asr[0]} passes coverage once phonetically matched",
+              cannalore_cov["missing"] == [] and cannalore_cov["fraction"] == 1.0,
+              repr(cannalore_cov))
+        check(f"Cannalore/{cannalore_asr[0]} passes terminal once phonetically matched",
+              cannalore_term["matched"], repr(cannalore_term))
+    check("a rare word entirely absent (no phonetic candidate) still fails coverage",
+          ordered_coverage(tokenize("Cannalore and Goa."),
+                           tokenize("and Goa."))["missing"] == ["cannalore"])
+    check("a phonetically unrelated wrong word still fails terminal",
+          not terminal_suffix(tokenize("Cannalore and Goa."),
+                              tokenize("Demolished and Goa."),
+                              phonetic_matches={})["matched"])
+    long_expected = tokenize(
+        "The abrupt abandonment of maritime ventures in the fourteen twenties "
+        "signalled part of a much broader problem for the declining empire.")
+    long_asr = tokenize(
+        "The abrupt abandonment of maritime ventures in the 1420s "
+        "signalled part of a much broader problem for the declining empire.")
+    check("coverage arithmetic on an ordinary long sentence is unchanged",
+          ordered_coverage(long_expected, long_asr, {})["fraction"] == 1.0)
 
     # Hyphen-boundary equivalence: a hyphen changes spelling, never sound, so
     # a mandatory word split across adjacent ASR tokens (or vice versa) is a
