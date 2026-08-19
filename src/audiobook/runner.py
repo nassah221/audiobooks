@@ -1212,6 +1212,20 @@ class Generator:
         cfg = rec.get("asr") or {}
         return cfg.get("model_repo") == asr_repo and cfg.get("model_revision") == asr_revision
 
+    @staticmethod
+    def _expected_text_sha256(chunk: dict) -> str:
+        """Hash of what was actually spoken (asr.normalize_for_tts(chunk
+        ["text"])) -- what _validate_chunk records as a take's
+        expected_sha256 since speak_text was introduced. NOT the same as
+        chunk["text_sha256"] (the untouched original, used for plan
+        identity) whenever normalize_for_tts changes anything: comparing
+        a validation record's expected_sha256 against the raw
+        text_sha256 would permanently mark every speak_text-affected
+        chunk (regnal numerals, entrepot, circa, glued numbers, ...) as
+        stale even though it validated correctly, blocking release
+        forever."""
+        return sha256_text(asr.normalize_for_tts(chunk["text"]))
+
     def _release_gate(self) -> dict:
         blocked = []
         for parent in self.plan["chunks"]:
@@ -1222,7 +1236,7 @@ class Generator:
                     if done.get("omitted"):
                         continue
                     if not self._record_ok(self._records.get(child["id"]),
-                                           child["text_sha256"], done["wav_sha256"],
+                                           self._expected_text_sha256(child), done["wav_sha256"],
                                            self.config.asr_repo, self.config.asr_revision):
                         blocked.append(child["id"])
                 continue
@@ -1233,7 +1247,7 @@ class Generator:
             if done.get("omitted"):
                 continue
             if not self._record_ok(self._records.get(parent["id"]),
-                                   parent["text_sha256"], done["wav_sha256"],
+                                   self._expected_text_sha256(parent), done["wav_sha256"],
                                    self.config.asr_repo, self.config.asr_revision):
                 blocked.append(parent["id"])
         return {"release": not blocked, "blocked": blocked}
@@ -1831,6 +1845,28 @@ def selfcheck() -> int:
               Generator._boundary_padding_frames(other[0], left, other[1], right) == 10800)
     check("record_ok rejects stale validation policy",
           not Generator._record_ok(dict(_pass, validation_policy="old"), "E", "W", _ar, _av))
+
+    # _release_gate compares a record's expected_sha256 against the SPOKEN
+    # text's hash, not the chunk's raw text_sha256 -- since v31 introduced
+    # speak_text, _validate_chunk records expected_sha256 = sha256(speak_text),
+    # so any speak_text-affected chunk (entrepot, circa, glued numbers,
+    # regnal numerals) has speak_text != chunk["text"], and comparing
+    # against the raw hash would block it from ever releasing even though
+    # it validated correctly. Found and fixed while running the actual ch2
+    # boundary validation -- 23 real chunks were stuck blocked this way.
+    _entrepot_release_text = "the great cultural entrepô t of the Islamic world."
+    _raw_sha = sha256_text(_entrepot_release_text)
+    _speak_sha = sha256_text(_asr.normalize_for_tts(_entrepot_release_text))
+    check("entrepot-style text: raw text_sha256 and speak_text's hash genuinely differ",
+          _raw_sha != _speak_sha)
+    _entrepot_rec = dict(_pass, chunk_id="x", wav_sha256="W", expected_sha256=_speak_sha)
+    check("record_ok accepts a record validated against speak_text's hash",
+          Generator._record_ok(_entrepot_rec, _speak_sha, "W", _ar, _av))
+    check("record_ok would have wrongly rejected it against the stale raw text_sha256 "
+          "(this is the bug the fix addresses)",
+          not Generator._record_ok(_entrepot_rec, _raw_sha, "W", _ar, _av))
+    check("_expected_text_sha256 computes the speak_text hash _validate_chunk actually uses",
+          Generator._expected_text_sha256({"text": _entrepot_release_text}) == _speak_sha)
     quiet_tail = np.r_[np.full(SAMPLE_RATE // 5, 0.2, dtype=np.float32),
                        np.zeros(SAMPLE_RATE // 5, dtype=np.float32)]
     clipped_tail = np.full(SAMPLE_RATE // 5, 0.2, dtype=np.float32)
