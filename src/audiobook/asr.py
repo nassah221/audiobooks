@@ -66,7 +66,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v26-curated-phrase-pairs"
+VALIDATION_POLICY = "paragraph-v27-thousand-hundred-compound"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -208,13 +208,32 @@ def _merge_thousand_tokens(tokens: list) -> list:
     same pattern as the century/hundred merges above. Unlike "N hundred"
     (where a non-teen two-digit prefix like "twenty hundred" is not
     idiomatic), "N thousand" is unambiguous English for any N, so every
-    digit prefix qualifies."""
+    digit prefix qualifies.
+
+    A directly following hundred-block ("two thousand five hundred" = 2500,
+    already merged to "2", "thousand", "500" by the century pass above)
+    adds on too -- both parts are round scale units, so unlike a bare
+    remainder ("fourteen hundred one"), no "and" is needed to disambiguate.
+    Any other trailing digit (not a clean hundred-block) still blocks the
+    merge, the same guard as before, e.g. "one thousand one" stays distinct
+    from "1000" or "1001"."""
     merged = []
     i = 0
     while i < len(tokens):
-        if (i + 1 < len(tokens) and str(tokens[i]).isdigit()
-                and str(tokens[i + 1]) == "thousand"
-                and (i + 2 == len(tokens) or not str(tokens[i + 2]).isdigit())):
+        if i + 1 < len(tokens) and str(tokens[i]).isdigit() and str(tokens[i + 1]) == "thousand":
+            nxt = tokens[i + 2] if i + 2 < len(tokens) else None
+            if nxt is None:
+                merged.append(str(int(tokens[i]) * 1000))
+                i += 2
+                continue
+            if str(nxt).isdigit() and 0 < int(nxt) < 1000 and int(nxt) % 100 == 0:
+                merged.append(str(int(tokens[i]) * 1000 + int(nxt)))
+                i += 3
+                continue
+            if str(nxt).isdigit():
+                merged.append(tokens[i])
+                i += 1
+                continue
             merged.append(str(int(tokens[i]) * 1000))
             i += 2
             continue
@@ -1653,6 +1672,21 @@ def selfcheck() -> int:
           tokenize("six hundred thousand") == tokenize("600000") == ["600000"])
     check("different thousand remains distinct",
           tokenize("one thousand") != tokenize("two thousand"))
+
+    # "N thousand M hundred" (2500, 12300, ...): both parts are round scale
+    # units, so unlike a bare hundred-remainder ("eight hundred forty-
+    # three"), no "and" is needed to disambiguate -- this is the standard
+    # unmarked way to speak such a number.
+    check("thousand-hundred compound equals written digits",
+          tokenize("two thousand five hundred miles") == tokenize("2500 miles"))
+    check("larger thousand-hundred compound equals written digits",
+          tokenize("twelve thousand three hundred delegates") ==
+          tokenize("12300 delegates"))
+    check("thousand-hundred equivalence reaches mandatory",
+          check_mandatory(tokenize("some 2500 miles west"),
+                          ["two thousand five hundred"])["missing"] == [])
+    check("thousand plus a non-hundred remainder stays unmerged",
+          tokenize("two thousand fifty") != tokenize("2050"))
     check("tokenize lowercases + strips punctuation",
           tokenize("The DEATH, of Tamerlane!") == ["the", "death", "of", "tamerlane"])
     check("number words -> digits", tokenize("fourteen oh five") == ["1405"])
