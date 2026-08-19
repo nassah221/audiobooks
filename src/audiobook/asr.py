@@ -67,7 +67,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v33-asr-fragile-lexicon"
+VALIDATION_POLICY = "paragraph-v35-phrase-token-alignment"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -1041,6 +1041,43 @@ def _phrase_in(asr: list, phrase: list, ratio: float) -> bool:
     return False
 
 
+def _phrase_align(phrase: list, asr: list, ratio: float) -> dict:
+    """Try to align a multi-token mandatory `phrase` against a contiguous,
+    positionally-matched window of `asr` (v35). Only called after
+    `_phrase_in` has already failed, so every window here fails the
+    equality-class ladder (exact, v22 vowel-swap, v23 curated pairs -- all
+    via `_tok_eq`, same comparator `_phrase_in` uses) for at least one
+    token. Each token may ALSO match via a demotion-class mechanism (v12
+    phonetic match, v33 lexicon) -- if every token matches by one path or
+    the other, the phrase is recoverable, but a phrase is never stronger
+    than its weakest evidence: one demoted token demotes the whole phrase.
+
+    Returns None if no window aligns every token, otherwise
+    {"pairs": {demoted_phrase_token: matched_asr_token, ...}} -- empty
+    `pairs` would mean every token matched via _tok_eq alone, which
+    `_phrase_in` already would have caught, so in practice a non-None
+    result here always has at least one pair."""
+    n = len(phrase)
+    for i in range(len(asr) - n + 1):
+        window = asr[i:i + n]
+        pairs = {}
+        ok = True
+        for tok, cand in zip(phrase, window):
+            if _tok_eq(tok, cand, ratio):
+                continue
+            if _phonetic_match(tok, cand):
+                pairs[tok] = cand
+                continue
+            if tok in _ASR_FRAGILE_LEXICON and _lexicon_match(tok, cand):
+                pairs[tok] = cand
+                continue
+            ok = False
+            break
+        if ok:
+            return {"pairs": pairs}
+    return None
+
+
 def is_fragile_mandatory(phrase: list) -> bool:
     """A mandatory item is ASR-fragile when it is a single bare number word/
     digit (0-99) after canonicalization, e.g. an enumerated-list marker
@@ -1070,20 +1107,31 @@ _PHONETIC_VOWEL_RE = re.compile(r"[aeiouy]")
 def _phonetic_skeleton(word: str) -> str:
     """Collapse a word to a coarse consonant skeleton so common digraph and
     vowel-spelling differences ("decentre" / "dissenter") fall out: lowercase,
-    map digraphs towards their sound (ph->f, gh (silent) -> dropped, ck->k,
-    q->k, c->s before e/i else k, x->ks), collapse doubled letters, then
-    drop vowels except a leading one (which carries the word's opening
-    sound).
+    map digraphs towards their sound (ph->f, gh->g, ck->k, q->k, c->s before
+    e/i else k, x->ks), collapse doubled letters, then drop vowels except a
+    leading one (which carries the word's opening sound).
 
     q->k (v32): "qullars" (a Persian/Ottoman administrative loanword,
     transliterated with a q) is /k/, the same phoneme as "colors"'s c --
     q was left as a distinct letter, so "qullars" (klrs after this fix)
     and Whisper's "colors" (klrs already, since c->k) never matched before
     this: q and k denote the same sound in English, so this is filling a
-    gap in an existing rule, not a new tolerance."""
+    gap in an existing rule, not a new tolerance.
+
+    gh->g, not gh->"" (v35): "bagh" (Persian, a walled garden -- "char-
+    bagh") ends in a real /g/, not the silent "gh" of native English
+    "though"/"night". Dropping "gh" entirely collapsed "bagh" to skeleton
+    "b" (losing the g sound along with the letters), so it could never
+    align with "bag"/"bug" (skeleton "bg" either way). Checked against
+    every phonetic/lexicon match already recorded in the generated books
+    before changing this: "gholamani" (gh at the START, same case) still
+    aligns with its real mishearings "golemani"/"gullamani" (all reduce to
+    "glmn" either way) -- the only match this removes is "gholamani" /
+    "ottoman", a skeleton coincidence from an already-rejected take that
+    passed no other gate anyway, not a real acceptance this depended on."""
     w = word.lower()
     w = w.replace("ph", "f")
-    w = w.replace("gh", "")
+    w = w.replace("gh", "g")
     w = w.replace("ck", "k")
     w = w.replace("q", "k")
     w = _PHONETIC_C_BEFORE_EI_RE.sub("s", w)
@@ -1173,17 +1221,23 @@ def _find_phonetic_match(word: str, asr: list) -> str:
 _ASR_FRAGILE_LEXICON = frozenset({"qullars"})
 
 
+def _lexicon_match(word: str, candidate: str) -> bool:
+    """True when `candidate` is a plausible mishearing of `word` under the
+    curated ASR-fragile lexicon's wider tolerance: same skeleton onset,
+    skeleton edit distance <= 2. Only ever meaningful for a word in
+    `_ASR_FRAGILE_LEXICON` -- callers check that first; see that set's
+    comment for why this wider tolerance is safe there but not as a
+    general rule."""
+    w_skel, c_skel = _phonetic_skeleton(word), _phonetic_skeleton(candidate)
+    return bool(w_skel) and bool(c_skel) and w_skel[0] == c_skel[0] and _levenshtein(w_skel, c_skel) <= 2
+
+
 def _find_lexicon_match(word: str, asr: list) -> str:
-    """First ASR token sharing `word`'s skeleton onset with skeleton edit
-    distance <= 2, or None. Only ever called for a word in
-    `_ASR_FRAGILE_LEXICON` -- see that set's comment for why this wider
-    tolerance is safe there but not as a general rule."""
-    w_skel = _phonetic_skeleton(word)
-    if not w_skel:
-        return None
+    """First ASR token that is a plausible mishearing of `word` under
+    `_lexicon_match`, or None. Only ever called for a word in
+    `_ASR_FRAGILE_LEXICON`."""
     for candidate in asr:
-        c_skel = _phonetic_skeleton(candidate)
-        if c_skel and c_skel[0] == w_skel[0] and _levenshtein(w_skel, c_skel) <= 2:
+        if _lexicon_match(word, candidate):
             return candidate
     return None
 
@@ -1300,6 +1354,20 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
         if concat:
             hyphen_matches[label] = concat
             continue
+        if len(phrase) > 1:
+            aligned = _phrase_align(phrase, asr, ratio)
+            if aligned:
+                # _phrase_align only ever returns a match here with at
+                # least one demoted pair (a fully _tok_eq-passing
+                # alignment would already have been caught by
+                # _phrase_in above) -- a phrase is never stronger than
+                # its weakest evidence, so the whole phrase demotes.
+                missing_fragile.append(label)
+                phonetic_matches.update(aligned["pairs"])
+                for tok, cand in aligned["pairs"].items():
+                    if tok in _ASR_FRAGILE_LEXICON:
+                        lexicon_matches[tok] = cand
+                continue
         if is_fragile_mandatory(phrase):
             missing_fragile.append(label)
             continue
@@ -2275,6 +2343,63 @@ def selfcheck() -> int:
     check("a non-lexicon rare word is unaffected by the wider lexicon tolerance",
           check_mandatory(tokenize("a conscious attempt to demolish europe"),
                           ["decentre"])["missing"] == ["decentre"])
+
+    # v35: per-token matching inside multi-token mandatory phrases. "char
+    # bagh" (a hyphenated Persian garden term, one phrase item per v24) had
+    # no path to any single-token mechanism (v12 phonetic, v22 vowel-swap,
+    # v23 curated pairs, v33 lexicon) since those only ever look at
+    # standalone mandatory items. Each token in the phrase now gets the
+    # same ladder a standalone token would: exact/canonicalized/vowel-swap/
+    # curated-pair match counts as ordinary equality; a demotion-class
+    # match (v12 phonetic, v33 lexicon) is allowed too, but demotes the
+    # WHOLE phrase to missing_fragile -- a phrase is never stronger than
+    # its weakest evidence. "bagh" needed the gh->g skeleton correction
+    # alongside this (see _phonetic_skeleton's docstring): the old gh->""
+    # fold collapsed "bagh" to skeleton "b", losing the g sound entirely
+    # and blocking any match to "bag"/"bug" (skeleton "bg" either way).
+    charbagh_source = "he wanted to create a proper char-bagh , an Iranian-style garden."
+    charbagh_expected = tokenize(charbagh_source)
+    charbagh_mand = derive_mandatory(charbagh_expected, charbagh_source)
+    check("char-bagh is derived as one hyphenated phrase item",
+          "char bagh" in charbagh_mand, repr(charbagh_mand))
+    for charbagh_transcript in (
+        "he wanted to create a proper char bag, an Iranian-style garden.",
+        "he wanted to create a proper char bug, an Iranian style garden.",
+    ):
+        charbagh_asr = tokenize(charbagh_transcript)
+        charbagh_check = check_mandatory(charbagh_asr, charbagh_mand)
+        check(f"char-bagh demotes and passes against {charbagh_transcript[-25:]!r}",
+              charbagh_check["missing"] == [] and
+              charbagh_check["missing_fragile"] == ["char bagh"] and
+              charbagh_check["phonetic_matches"].get("bagh") in ("bag", "bug"),
+              repr(charbagh_check))
+        charbagh_cov = ordered_coverage(charbagh_expected, charbagh_asr,
+                                        charbagh_check["phonetic_matches"])
+        charbagh_term = terminal_suffix(charbagh_expected, charbagh_asr,
+                                        phonetic_matches=charbagh_check["phonetic_matches"])
+        check(f"char-bagh passes coverage and terminal against {charbagh_transcript[-25:]!r}",
+              charbagh_cov["missing"] == [] and charbagh_term["matched"],
+              repr((charbagh_cov, charbagh_term)))
+    check("a phrase with one genuinely unrelated token still hard-fails",
+          check_mandatory(tokenize("he built a proper char house nearby."),
+                          ["char bagh"])["missing"] == ["char bagh"])
+    check("a fully-exact phrase still full-passes (no demotion needed)",
+          check_mandatory(tokenize("he built a proper char bagh nearby."),
+                          ["char bagh"])["missing_fragile"] == [])
+    # Single-token behavior regression net: every v8-v33 case above still
+    # holds byte-identical after the gh->g skeleton change and the new
+    # phrase-alignment code path.
+    check("v35 regression net: decentre/dissenter demotion unaffected",
+          check_mandatory(tokenize("a conscious attempt to dissenter europe"),
+                          ["decentre"])["missing_fragile"] == ["decentre"])
+    check("v35 regression net: qullars/colors and qullars/Kulas unaffected",
+          check_mandatory(tokenize("bureaucracy of colors."),
+                          ["qullars"])["phonetic_matches"].get("qullars") == "colors"
+          and check_mandatory(tokenize("ruled by Kulas."),
+                              ["qullars"])["lexicon_matches"].get("qullars") == "kulas")
+    check("v35 regression net: cracow/krakow transliteration pair unaffected",
+          check_mandatory(tokenize("printed in Krakow in 1423."),
+                          ["cracow"])["missing"] == [])
 
     # v25: coverage/terminal must not contradict a phonetic match the
     # mandatory gate already made and recorded -- no new fuzzy comparison,
