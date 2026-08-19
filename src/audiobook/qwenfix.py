@@ -93,6 +93,44 @@ SIBILANT_WINDOW_SECONDS = 0.35
 
 _SILENCE_AMPLITUDE = 0.01
 
+# Context-drift gate (icl-rolling-v2): rolling ICL context compounds a
+# loss of high-frequency energy down a chain -- measured -35% high-band
+# energy by chain depth 3, r=-0.39 vs depth across chapter 1 (see
+# outputs/batch4-bench/drift-analysis.md), heard as increasingly
+# underwater/muffled audio, clearing again at the next paragraph start
+# (where the chain resets). A take's own acceptance is never affected by
+# this -- it only gates whether that take's codes are trustworthy enough
+# to hand to the NEXT chunk as context.
+CONTEXT_DRIFT_HIGH_FRAC_MIN = 0.006
+CONTEXT_CHAIN_DEPTH_MAX = 3
+
+
+def speech_high_band_frac(audio, sample_rate) -> float:
+    """Mean 2-8 kHz energy fraction over speech (non-quiet) regions of the
+    WHOLE take -- unlike final_sibilant_high_frac (4-10 kHz, last 350 ms
+    only, gates take acceptance), this measures overall spectral richness
+    to gate context reuse (see CONTEXT_DRIFT_HIGH_FRAC_MIN)."""
+    import numpy as np
+
+    x = np.asarray(audio)
+    nonquiet = np.flatnonzero(np.abs(x) > _SILENCE_AMPLITUDE)
+    if not nonquiet.size:
+        return 0.0
+    seg = x[int(nonquiet[0]):int(nonquiet[-1]) + 1]
+    w = int(0.025 * sample_rate)
+    if w <= 0 or len(seg) < w:
+        return 0.0
+    fracs = []
+    for i in range(len(seg) // w):
+        win = seg[i * w:(i + 1) * w] * np.hanning(w)
+        if float(np.sqrt(np.mean(win ** 2))) < 0.002:
+            continue
+        spec = np.abs(np.fft.rfft(win)) ** 2
+        freqs = np.fft.rfftfreq(w, 1 / sample_rate)
+        high = spec[(freqs >= 2000) & (freqs <= 8000)].sum()
+        fracs.append(float(high / (spec.sum() + 1e-12)))
+    return float(np.mean(fracs)) if fracs else 0.0
+
 # mlx-audio compiles the vocoder decoder with ``mx.compile`` at model load
 # (qwen3_tts.py, ~line 2903), which retraces whenever ``chunked_decode`` is
 # called with a frame count it has not seen before. Almost every chunk has a

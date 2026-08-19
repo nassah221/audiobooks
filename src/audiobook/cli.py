@@ -101,6 +101,11 @@ def _print_validate(rpt: dict) -> None:
     if rpt.get("book"):
         b = rpt["book"]
         print(f"  book: assembled {b['wav']} ({b['seconds']}s audio, {b['chapters']} chapters)")
+    elif rpt.get("failed_chunks"):
+        print(f"  book: NOT assembled -- {len(rpt['failed_chunks'])} chunk(s) in the "
+              f"continue-on-failure set: {rpt['book_blocked_reason']}")
+        for cid in rpt["failed_chunks"]:
+            print(f"    {cid}")
 
 
 def _print_eta(rpt: dict) -> None:
@@ -137,6 +142,10 @@ def main(argv=None) -> int:
             print(f"generated {summary['generated']} chunk(s); {summary['done_total']}/"
                   f"{summary['plan']['groups']} done "
                   f"(gen {summary['generation_seconds']}s, audio {summary['audio_seconds']}s)")
+            if summary.get("failed_total"):
+                print(f"  {summary['failed_total']} chunk(s) FAILED (deferred, continue-on-failure):")
+                for f in summary["failed"]:
+                    print(f"    {f['chunk_id']}: {f['reason']}")
         elif args.cmd == "validate":
             _print_validate(runner.validate_generated(
                 root, out, chapters=args.chapters, limit=args.limit))

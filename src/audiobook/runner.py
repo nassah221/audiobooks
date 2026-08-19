@@ -248,14 +248,21 @@ def run_fingerprint(cfg: Config, ref_wav_sha: str, ref_text_sha: str) -> str:
                   "seed": cfg.seed},
         "asr": {"repo": cfg.asr_repo, "revision": cfg.asr_revision},
         "planner": planner, "sample_rate": SAMPLE_RATE, "stream": False,
-        "generation": {"policy": "icl-rolling-v1",
+        "generation": {"policy": "icl-rolling-v2",
                        "eos_hold_frames": qwenfix.EOS_HOLD_FRAMES,
                        "tail_max_silence_seconds": qwenfix.TAIL_MAX_SILENCE_SECONDS,
                        "tail_fade_seconds": qwenfix.TAIL_FADE_SECONDS,
                        "sibilant_high_frac_min": qwenfix.SIBILANT_HIGH_FRAC_MIN,
                        "context_window_units": 1,
                        "context_scope": "paragraph",
-                       "context_on_retry": False},
+                       "context_on_retry": False,
+                       # Context-drift gate (v2): a take's codes are usable
+                       # as context for the next chunk only above this
+                       # high-band energy floor, and never past this chain
+                       # depth regardless of quality -- see
+                       # qwenfix.speech_high_band_frac / _context_decision.
+                       "context_drift_high_frac_min": qwenfix.CONTEXT_DRIFT_HIGH_FRAC_MIN,
+                       "context_chain_depth_max": qwenfix.CONTEXT_CHAIN_DEPTH_MAX},
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -762,6 +769,10 @@ class Generator:
         self._records = self._load_records()
         self._attempt_failures = {}
         self._forced_parents = set()
+        # Last successfully-generated (not necessarily accepted) take per
+        # chunk id, this run only -- lets _record_failure capture the
+        # retained wav's structural facts without re-reading the file.
+        self._last_attempt = {}
         # Last accepted unit, for rolling-context conditioning (in-memory
         # only: generated codec frames are never persisted across runs, so
         # a resumed run always starts with no context, even mid-paragraph).
@@ -798,6 +809,13 @@ class Generator:
 
     def _load_state(self):
         self.done = {}
+        # Continue-on-failure set: chunk id -> {text_sha256, reasons,
+        # wav, wav_sha256, samples, seconds, terminal_silence_seconds,
+        # tail_frame_peak, failed_policy, failed_unix}. Additive state --
+        # an existing state.json with no "failed" key (every directory
+        # before this feature shipped) loads as {} here, so resume
+        # compatibility for already-generated chapters is unaffected.
+        self.failed = {}
         self.started_unix = time.time()
         if self.state_path.is_file():
             st = json.loads(self.state_path.read_text())
@@ -811,6 +829,7 @@ class Generator:
                     )
             else:
                 self.done = st.get("done", {})
+                self.failed = st.get("failed", {})
                 self.started_unix = st.get("started_unix", self.started_unix)
         self._save_state()
 
@@ -824,6 +843,7 @@ class Generator:
             "sample_rate": SAMPLE_RATE,
             "plan": self._plan_identity(),
             "done": self.done,
+            "failed": self.failed,
             "started_unix": self.started_unix,
         }
         _atomic_write_json(self.state_path, state)
@@ -848,13 +868,29 @@ class Generator:
         }
         _atomic_write_json(self._records_path(), payload)
 
+    def _has_failed_descendant(self, chunk: dict) -> bool:
+        """True when `chunk` itself, or one of its clause children, is in
+        the continue-on-failure set -- used to push previously-failed work
+        behind never-attempted work in `_pending_chunks`."""
+        if chunk["id"] in self.failed:
+            return True
+        return any(child["id"] in self.failed for child in self._child_chunks(chunk))
+
     def _pending_chunks(self):
         if self.force:
             for parent in self.plan["chunks"]:
                 if parent["id"] not in self._forced_parents:
                     self._invalidate_forced_parent(parent)
             return list(self.plan["chunks"])
-        return [chunk for chunk in self.plan["chunks"] if not self._is_done(chunk)]
+        # Failed chunks are re-selectable, but only AFTER every
+        # never-attempted chunk: a fresh chunk should never wait behind a
+        # retry of something that already burned an attempt budget.
+        fresh, retry = [], []
+        for chunk in self.plan["chunks"]:
+            if self._is_done(chunk):
+                continue
+            (retry if self._has_failed_descendant(chunk) else fresh).append(chunk)
+        return fresh + retry
     @staticmethod
     def _chunk_status(chunk: dict, done: dict, force: bool) -> str:
         if force:
@@ -932,10 +968,106 @@ class Generator:
                 "terminal_silence_seconds": record["terminal_silence_seconds"],
                 "tail_frame_peak": record.get("tail_frame_peak", 0.0),
                 "context_chunk_id": record.get("context_chunk_id"),
+                # Context-drift gate (icl-rolling-v2) audit trail: measured
+                # high-band fraction, chain depth, and whether this take's
+                # codes were usable as context for the next chunk -- kept
+                # regardless of the decision, so future analysis is free.
+                "context_high_frac": record.get("context_high_frac"),
+                "context_depth": record.get("context_depth"),
+                "context_usable": record.get("context_usable"),
             }
         # Persist the record before state marks this unit done.
         self._save_records()
         self._save_state()
+
+    def _finalize_take(self, record: dict) -> None:
+        """Compute the context-drift decision once, stash it onto `record`
+        so `_record_chunk` persists it, then record the chunk and update
+        rolling context accordingly. The one path both the parent-unit and
+        child-unit acceptance branches in `run()` share."""
+        decision = self._context_decision(record)
+        record["context_depth"] = decision["depth"]
+        record["context_usable"] = decision["context_usable"]
+        self._record_chunk(record)
+        self._accept_rolling(record, decision)
+
+    @staticmethod
+    def _chunk_wav_rel(chunk: dict) -> str:
+        return f"chunks/{chunk['chapter']}/{chunk['id'].replace(':', '-')}.wav"
+
+    def _record_failure(self, chunk: dict, failures: list) -> None:
+        """Continue-on-failure: record a chunk that exhausted its retry
+        budget into the persisted `failed` set instead of raising. The
+        last attempt's wav is left exactly where `_generate` wrote it
+        (never deleted) so a later policy fix can revalidate it without a
+        new TTS call -- see `_maybe_promote_failed`. Structural facts come
+        from `self._last_attempt` (this run's last successfully-generated,
+        not necessarily accepted, take for this chunk); if every attempt
+        raised before producing audio, those are absent, and there is no
+        wav to keep the sha of.
+        """
+        last = self._last_attempt.pop(chunk["id"], None)
+        rel = self._chunk_wav_rel(chunk)
+        wav_path = self.out_dir / rel
+        wav_sha = sha256_file(wav_path) if wav_path.is_file() else None
+        self.failed[chunk["id"]] = {
+            "text_sha256": chunk["text_sha256"],
+            "reasons": list(failures),
+            "wav": rel if wav_sha else None,
+            "wav_sha256": wav_sha,
+            "samples": last.get("samples") if last else None,
+            "seconds": last.get("seconds") if last else None,
+            "terminal_silence_seconds": last.get("terminal_silence_seconds") if last else None,
+            "tail_frame_peak": last.get("tail_frame_peak") if last else None,
+            "failed_policy": asr.VALIDATION_POLICY,
+            "failed_unix": time.time(),
+        }
+        # A chunk can only be in one of done/failed at a time.
+        self.done.pop(chunk["id"], None)
+        self._save_state()
+        reason = failures[-1] if failures else "no diagnostic available"
+        print(f"  {chunk['id']}  FAILED (deferred, continue-on-failure): {reason}",
+              file=sys.stderr)
+
+    def _maybe_promote_failed(self, chunk: dict) -> bool:
+        """If `chunk` is in the failed set, its retained wav is unchanged
+        on disk, and it now passes the structural gate and (if enabled)
+        ASR validation -- e.g. a gate/lexical fix landed since it failed --
+        promote it straight to done with NO new TTS call. Returns True iff
+        promoted; callers should treat that exactly like a fresh success
+        (skip generation) and False like "still needs a fresh attempt."
+        """
+        entry = self.failed.get(chunk["id"])
+        if not entry or entry.get("text_sha256") != chunk["text_sha256"] or not entry.get("wav"):
+            return False
+        wav = self.out_dir / entry["wav"]
+        if not wav.is_file() or sha256_file(wav) != entry.get("wav_sha256"):
+            return False
+        tail_frame_peak = entry.get("tail_frame_peak")
+        if tail_frame_peak is None or float(tail_frame_peak) > qwenfix.TAIL_FRAME_PEAK_MAX:
+            return False
+        if self.validate:
+            vrec = self._validator().validate_many([{
+                "wav": str(wav),
+                "expected_text": asr.normalize_for_tts(chunk["text"]),
+                "chunk_id": chunk["id"],
+            }])[0]
+            if not _take_passes(vrec):
+                return False
+            self._records[chunk["id"]] = vrec
+        self.done[chunk["id"]] = {
+            "text_sha256": entry["text_sha256"], "wav": entry["wav"],
+            "wav_sha256": entry["wav_sha256"], "samples": entry.get("samples"),
+            "seconds": entry.get("seconds"),
+            "terminal_silence_seconds": entry.get("terminal_silence_seconds"),
+            "tail_frame_peak": tail_frame_peak,
+            "context_chunk_id": None,
+        }
+        del self.failed[chunk["id"]]
+        self._save_records()
+        self._save_state()
+        print(f"  {chunk['id']}  promoted from failed set (revalidated, no TTS call)")
+        return True
 
     def _maybe_omit_unspeakable(self, chunk: dict) -> bool:
         """Skip generation entirely for a unit with no alphabetic content (a
@@ -988,15 +1120,53 @@ class Generator:
             return None
         return rolling
 
-    def _accept_rolling(self, record: dict) -> None:
+    def _context_decision(self, record: dict) -> dict:
+        """Context-drift gate (icl-rolling-v2): decide whether `record`'s
+        codes are trustworthy enough to hand to the NEXT chunk as ICL
+        context. Never affects whether `record` itself is accepted into
+        the book -- only whether ITS codes get reused.
+
+        Two independent triggers, either one blocks reuse:
+        1. high_frac below CONTEXT_DRIFT_HIGH_FRAC_MIN: rolling context
+           compounds a loss of high-frequency energy down a chain
+           (measured -35% by depth 3), heard as increasingly muffled
+           audio.
+        2. depth >= CONTEXT_CHAIN_DEPTH_MAX: a hard cap independent of
+           this take's own quality -- a chunk at depth 3 never passes its
+           codes onward, so a chain resets at latest every 3 hops even
+           when every take individually measures clean.
+
+        depth 0 means "not itself conditioned on prior context" (a
+        paragraph start, or the chunk right after a reset); depth N means
+        conditioned on a chain of N prior chunks in the same paragraph.
+        """
+        prev = self._rolling
+        same_chain = (prev is not None and prev.get("chapter") == record["chapter"]
+                      and prev.get("paragraph_index") == record["paragraph_index"])
+        depth = (prev["depth"] + 1) if same_chain else 0
+        high_frac = record.get("context_high_frac")
+        usable = (high_frac is not None
+                  and high_frac >= qwenfix.CONTEXT_DRIFT_HIGH_FRAC_MIN
+                  and depth < qwenfix.CONTEXT_CHAIN_DEPTH_MAX)
+        return {"depth": depth, "high_frac": high_frac, "context_usable": usable}
+
+    def _accept_rolling(self, record: dict, decision: dict = None) -> None:
         """Track the last accepted unit for rolling-context conditioning.
 
         Only called for takes that passed structural gates and validation
         (see `_generate_with_retries`/`run`), so a rejected take never
-        poisons the chain.
+        poisons the chain. `decision` (from `_context_decision`) may be
+        passed in already computed, since `run()` also needs it to record
+        per-chunk fields before this runs; if omitted, it is computed here
+        (kept optional for existing direct callers/tests).
         """
         codes = record.get("_gen_codes")
         if codes is None:
+            return
+        if decision is None:
+            decision = self._context_decision(record)
+        if not decision["context_usable"]:
+            self._rolling = None
             return
         self._rolling = {
             "chunk_id": record["id"],
@@ -1007,6 +1177,7 @@ class Generator:
             # next chunk must describe the text that actually produced them.
             "text": record.get("speak_text", record["text"]),
             "codes": codes,
+            "depth": decision["depth"],
         }
 
     def _ref_audio_array(self):
@@ -1049,6 +1220,7 @@ class Generator:
         tail_frame_peak = qwenfix.tail_frame_peak(audio, SAMPLE_RATE)
         sibilant_frac = qwenfix.final_sibilant_high_frac(
             audio, SAMPLE_RATE, speak_text)
+        context_high_frac = qwenfix.speech_high_band_frac(audio, SAMPLE_RATE)
         rel = f"chunks/{chunk['chapter']}/{chunk['id'].replace(':', '-')}.wav"
         wav = self.out_dir / rel
         wav.parent.mkdir(parents=True, exist_ok=True)
@@ -1089,6 +1261,7 @@ class Generator:
             "tail_frame_peak": round(tail_frame_peak, 6),
             "final_sibilant_high_frac": (
                 None if sibilant_frac is None else round(sibilant_frac, 4)),
+            "context_high_frac": round(context_high_frac, 6),
             "seconds": facts["seconds"], "generation_seconds": round(gen_seconds, 4),
             "model": {"repo": self.config.model_repo, "revision": self.config.model_revision},
             "reference_wav_sha256": self.ref_wav_sha,
@@ -1149,6 +1322,16 @@ class Generator:
             context = base_context if attempt == 0 else None
             try:
                 record = self._generate(chunk, model, attempt=attempt, context=context)
+                # Tracked regardless of pass/fail: on exhaustion, the wav
+                # this attempt wrote is what's left on disk, and
+                # _record_failure needs its structural facts to let a
+                # later policy fix revalidate it without a new TTS call.
+                # getattr guard: minimal test doubles built with
+                # object.__new__(Generator) may not set this up, and
+                # tracking it is a pure bookkeeping side effect, not core
+                # to what those tests exercise.
+                if hasattr(self, "_last_attempt"):
+                    self._last_attempt[chunk["id"]] = record
                 structural = None
                 if float(record.get("tail_frame_peak", 0.0)) > qwenfix.TAIL_FRAME_PEAK_MAX:
                     structural = "speech reaches into the room-tone tail"
@@ -1405,25 +1588,34 @@ class Generator:
             if self._maybe_omit_unspeakable(chunk):
                 print(f"  {chunk['id']}  omitted (non-speech text)  ({i}/{total})")
                 continue
+            if self._maybe_promote_failed(chunk):
+                continue
             record, failures = self._generate_with_retries(chunk, self._model)
             if record is None:
                 children = self._child_chunks(chunk)
                 if not children:
-                    raise self._retry_error(chunk, failures)
+                    # Continue-on-failure: record and move to the next
+                    # pending chunk instead of aborting the whole run.
+                    self._record_failure(chunk, failures)
+                    continue
                 records = []
                 for child in children:
                     if self._maybe_omit_unspeakable(child):
                         continue
+                    if self._maybe_promote_failed(child):
+                        continue
                     child_record, child_failures = self._generate_with_retries(child, self._model)
                     if child_record is None:
-                        raise self._retry_error(child, child_failures)
-                    self._record_chunk(child_record)
-                    self._accept_rolling(child_record)
+                        self._record_failure(child, child_failures)
+                        continue
+                    self._finalize_take(child_record)
                     records.append(child_record)
             else:
-                self._record_chunk(record)
-                self._accept_rolling(record)
+                self.failed.pop(chunk["id"], None)
+                self._finalize_take(record)
                 records = [record]
+            if not records:
+                continue
             gen_cum += sum(r["generation_seconds"] for r in records)
             audio_cum += sum(r["seconds"] for r in records)
             print(f"  {chunk['id']}  gen {sum(r['generation_seconds'] for r in records):5.2f}s "
@@ -1438,6 +1630,9 @@ class Generator:
                      "groups": self.plan["total_groups"]},
             "generated": len(pending),
             "done_total": sum(1 for c in self.plan["chunks"] if self._is_done(c)),
+            "failed_total": len(self.failed),
+            "failed": [{"chunk_id": cid, "reason": entry["reasons"][-1] if entry.get("reasons") else None}
+                       for cid, entry in sorted(self.failed.items())],
             "generation_seconds": round(gen_cum, 2),
             "audio_seconds": round(audio_cum, 2),
             "load_seconds": round(self.load_seconds, 2) if self.load_seconds is not None else None,
@@ -1452,6 +1647,15 @@ class Generator:
                 self._remove_book_artifacts()
                 summary["book"] = None
                 summary["blocked"] = gate["blocked"]
+        elif self.plan["chunks"] and self.failed:
+            # Loud, explicit: a non-empty failed set means real content is
+            # missing from the book, never silently -- distinct from the
+            # ordinary "still generating" case below.
+            print(f"  book.wav not built: {len(self.failed)} chunk(s) PERMANENTLY FAILED "
+                  "(continue-on-failure mode) -- resolve before assembly:", file=sys.stderr)
+            for cid, entry in sorted(self.failed.items()):
+                reason = entry["reasons"][-1] if entry.get("reasons") else "no diagnostic available"
+                print(f"    {cid}: {reason}", file=sys.stderr)
         elif self.plan["chunks"]:
             print("  book.wav not built: plan incomplete; re-run to resume")
         return summary
@@ -1542,15 +1746,22 @@ def validate_generated(root, out_dir, *, chapters=None, limit=None, config=None)
     # every planned chunk was validated and none failed. Requires the state to
     # match this run (already checked above), so resuming the generator loads
     # the same done set. Loads no model.
-    if not failed:
-        g = Generator(root, out_dir, config=cfg, chapters=chapters, limit=limit)
-        if g._plan_complete() and g._release_gate()["release"]:
-            book = g._concatenate()
-            result["book"] = {
-                "wav": BOOK_WAV_REL,
-                "seconds": book["seconds"],
-                "chapters": len(book["chapters"]),
-            }
+    g = Generator(root, out_dir, config=cfg, chapters=chapters, limit=limit)
+    result["failed_chunks"] = sorted(g.failed)
+    if failed or g.failed:
+        # Refuse, loudly: a non-empty continue-on-failure set means real
+        # sentences are missing from the book, never a silent gap.
+        if g.failed:
+            result["book_blocked_reason"] = (
+                f"{len(g.failed)} chunk(s) in the continue-on-failure set; "
+                "resolve (fix + revalidate, or adjudicate) before assembly")
+    elif g._plan_complete() and g._release_gate()["release"]:
+        book = g._concatenate()
+        result["book"] = {
+            "wav": BOOK_WAV_REL,
+            "seconds": book["seconds"],
+            "chapters": len(book["chapters"]),
+        }
     return result
 
 
@@ -2229,16 +2440,21 @@ def selfcheck() -> int:
           and ctx_calls[0] == _rolling_p2 and ctx_calls[1] is None)
 
     # _accept_rolling only tracks accepted takes that produced codec frames.
+    # context_high_frac well above CONTEXT_DRIFT_HIGH_FRAC_MIN here -- these
+    # tests verify the pre-existing text/codes tracking, not the drift gate
+    # itself (that gets its own tests below).
     accept_gen = object.__new__(Generator)
     accept_gen._rolling = None
     accept_gen._accept_rolling({
         "id": "ch01:p0002:s0002", "paragraph_index": 2, "chapter": "ch01",
         "text": "Second chunk.", "_gen_codes": "codes-obj",
+        "context_high_frac": 0.05,
     })
     check("accepted take becomes rolling context",
           accept_gen._rolling == {
               "chunk_id": "ch01:p0002:s0002", "paragraph_index": 2,
-              "chapter": "ch01", "text": "Second chunk.", "codes": "codes-obj"})
+              "chapter": "ch01", "text": "Second chunk.", "codes": "codes-obj",
+              "depth": 0})
     accept_gen._accept_rolling({"id": "x", "paragraph_index": 2, "chapter": "ch01",
                                  "text": "no codes"})
     check("record without codes leaves rolling context unchanged",
@@ -2252,10 +2468,119 @@ def selfcheck() -> int:
         "id": "ch01:p0003:s0000", "paragraph_index": 3, "chapter": "ch01",
         "text": "Abbas I, the fifth Safavid shah.",
         "speak_text": "Abbas the First, the fifth Safavid shah.",
-        "_gen_codes": "codes-obj",
+        "_gen_codes": "codes-obj", "context_high_frac": 0.05,
     })
     check("rolling context text is speak_text, not the original chunk text",
           speak_gen._rolling["text"] == "Abbas the First, the fifth Safavid shah.")
+
+    # --- context-drift gate (icl-rolling-v2) --------------------------------
+    # Rolling ICL context compounds a loss of high-frequency energy down a
+    # chain (measured -35% high-band energy by depth 3 across chapter 1) --
+    # heard as increasingly muffled/underwater audio. Two independent
+    # triggers gate whether a take's codes are reused as context for the
+    # NEXT chunk; neither ever affects whether the take itself is accepted.
+    drift_gen = object.__new__(Generator)
+    drift_gen._rolling = None
+    drift_gen._accept_rolling({
+        "id": "ch01:p0010:s0000", "paragraph_index": 10, "chapter": "ch01",
+        "text": "Low quality take.", "_gen_codes": "codes-low",
+        "context_high_frac": 0.002,  # below CONTEXT_DRIFT_HIGH_FRAC_MIN (0.006)
+    })
+    check("a low-high-band take is not usable as context for the next chunk",
+          drift_gen._rolling is None)
+    check("that chunk therefore generates context-free, exactly like a paragraph start",
+          Generator._rolling_context_for(
+              drift_gen._rolling,
+              {"id": "ch01:p0010:s0001", "chapter": "ch01", "paragraph_index": 10}
+          ) is None)
+
+    # Depth cap: a chunk at depth 3 never passes its codes onward, even
+    # with a clean high_frac every time -- an independent second trigger.
+    depth_gen = object.__new__(Generator)
+    depth_gen._rolling = None
+    depths_seen = []
+    for n in range(5):
+        depth_gen._accept_rolling({
+            "id": f"ch01:p0020:s000{n}", "paragraph_index": 20, "chapter": "ch01",
+            "text": f"Clean chunk {n}.", "_gen_codes": f"codes-{n}",
+            "context_high_frac": 0.05,  # comfortably clean every time
+        })
+        depths_seen.append(depth_gen._rolling["depth"] if depth_gen._rolling else None)
+    check("depth increments 0,1,2 while chaining, then the cap breaks the chain",
+          depths_seen == [0, 1, 2, None, 0],
+          repr(depths_seen))
+
+    # Clean takes chain exactly as before this feature, when quality never
+    # dips and the chain never reaches the depth cap.
+    clean_gen = object.__new__(Generator)
+    clean_gen._rolling = None
+    clean_gen._accept_rolling({
+        "id": "ch01:p0030:s0000", "paragraph_index": 30, "chapter": "ch01",
+        "text": "First.", "_gen_codes": "codes-a", "context_high_frac": 0.02,
+    })
+    clean_gen._accept_rolling({
+        "id": "ch01:p0030:s0001", "paragraph_index": 30, "chapter": "ch01",
+        "text": "Second.", "_gen_codes": "codes-b", "context_high_frac": 0.02,
+    })
+    check("clean takes chain as before (text/codes/depth all track correctly)",
+          clean_gen._rolling == {
+              "chunk_id": "ch01:p0030:s0001", "paragraph_index": 30,
+              "chapter": "ch01", "text": "Second.", "codes": "codes-b", "depth": 1})
+
+    # Recording: _finalize_take stashes the decision onto the record so
+    # _record_chunk persists high_frac/depth/usable regardless of outcome.
+    record_gen = object.__new__(Generator)
+    record_gen._rolling = None
+    record_gen.done = {}
+    record_gen._save_records = lambda: None
+    record_gen._save_state = lambda: None
+    rec_low = {"id": "ch01:p0040:s0000", "text_sha256": "h", "wav": "w.wav",
+               "wav_sha256": "ws", "samples": 10, "seconds": 0.1,
+               "terminal_silence_seconds": 0.0, "paragraph_index": 40,
+               "chapter": "ch01", "_gen_codes": "codes-x", "context_high_frac": 0.001}
+    record_gen._finalize_take(rec_low)
+    check("recording fields (high_frac, depth, usable) land in the done entry",
+          record_gen.done[rec_low["id"]]["context_high_frac"] == 0.001
+          and record_gen.done[rec_low["id"]]["context_depth"] == 0
+          and record_gen.done[rec_low["id"]]["context_usable"] is False)
+
+    # Fingerprint: bumping the generation policy string must produce a
+    # DIFFERENT fingerprint, so a v2 binary refuses (never silently
+    # touches) an existing v1 state.json -- the same mismatch guard
+    # _load_state already enforces, no new code needed for this part.
+    # Reconstruct the exact pre-drift-gate ("icl-rolling-v1") payload shape
+    # and confirm the current run_fingerprint output differs from it -- the
+    # concrete proof that a v1 state.json's stored fingerprint no longer
+    # matches, so _load_state's existing mismatch guard (unchanged by this
+    # feature) refuses it rather than silently reinterpreting it. v1 dirs
+    # (chapter 1, chapter 2) are simply never touched by v2 code as a
+    # result -- no special-case code needed for that.
+    _v1_style_payload = {
+        "book": {"path": _base.book, "sha256": _base.book_sha256},
+        "voice": {"audio": _base.audio, "wav_sha256": "w",
+                  "transcript": _base.transcript, "text_sha256": "t"},
+        "model": {"repo": _base.model_repo, "revision": _base.model_revision,
+                  "language": _base.language, "max_tokens": _base.max_tokens,
+                  "seed": _base.seed},
+        "asr": {"repo": _base.asr_repo, "revision": _base.asr_revision},
+        "planner": {"policy": epub.SENTENCE_GROUP_POLICY,
+                    "version": epub.SENTENCE_GROUP_VERSION,
+                    "limits": dict(epub.SENTENCE_GROUP_LIMITS),
+                    "clause_policy": CLAUSE_SPLIT_POLICY},
+        "sample_rate": SAMPLE_RATE, "stream": False,
+        "generation": {"policy": "icl-rolling-v1",
+                       "eos_hold_frames": qwenfix.EOS_HOLD_FRAMES,
+                       "tail_max_silence_seconds": qwenfix.TAIL_MAX_SILENCE_SECONDS,
+                       "tail_fade_seconds": qwenfix.TAIL_FADE_SECONDS,
+                       "sibilant_high_frac_min": qwenfix.SIBILANT_HIGH_FRAC_MIN,
+                       "context_window_units": 1, "context_scope": "paragraph",
+                       "context_on_retry": False},
+    }
+    _v1_style_fp = hashlib.sha256(
+        json.dumps(_v1_style_payload, sort_keys=True).encode()).hexdigest()
+    check("icl-rolling-v2 changes the fingerprint vs. the old v1 payload shape "
+          "(a v1 state.json is refused, not silently reinterpreted)",
+          _v1_style_fp != fp1)
 
     # v31 plan-identity trap: normalize_for_tts must never reach chunk id,
     # text_sha256, or anything build_plan/_child_chunks hash -- those stay
@@ -2280,6 +2605,179 @@ def selfcheck() -> int:
           _entrepot_chunk["text"] == _entrepot_text
           and _entrepot_chunk["text_sha256"] == sha256_text(_entrepot_text)
           and _entrepot_chunk["text_sha256"] != sha256_text(asr.normalize_for_tts(_entrepot_text)))
+
+    # --- continue-on-failure mode -----------------------------------------
+    # Kills the stop-the-world failure model: a chunk that exhausts its
+    # retry budget is recorded into a persisted `failed` set instead of
+    # raising, so one hard chunk no longer blocks every chunk after it.
+
+    # 1. Deferral: _record_failure must not raise, and must land the chunk
+    # in `failed`, never `done` -- the two are mutually exclusive by
+    # construction (each path pops the other).
+    cof_gen = object.__new__(Generator)
+    cof_gen.out_dir = pathlib.Path(tempfile.mkdtemp())
+    cof_gen.validate = False
+    cof_gen.done = {}
+    cof_gen.failed = {}
+    cof_gen._records = {}
+    cof_gen._last_attempt = {}
+    cof_gen._save_records = lambda: None
+    cof_gen._save_state = lambda: None
+    cof_text = "A hard sentence that never validates."
+    cof_chunk = {"id": "ch01:p0100:s0000-0001", "chapter": "ch01",
+                 "text": cof_text, "text_sha256": sha256_text(cof_text)}
+    cof_gen._record_failure(cof_chunk, ["attempt 0: mandatory missing: ['x']",
+                                        "attempt 1: mandatory missing: ['x']"])
+    check("continue-on-failure defers (no raise) and records into the failed set",
+          cof_chunk["id"] in cof_gen.failed and cof_chunk["id"] not in cof_gen.done)
+    check("failed entry keeps the last reason and text_sha256",
+          cof_gen.failed[cof_chunk["id"]]["reasons"][-1] == "attempt 1: mandatory missing: ['x']"
+          and cof_gen.failed[cof_chunk["id"]]["text_sha256"] == cof_chunk["text_sha256"])
+
+    # 2. Re-attempt ordering: never-attempted chunks come before failed
+    # ones, regardless of plan order, so a fresh chunk never waits behind
+    # a retry that already burned an attempt budget.
+    order_gen = object.__new__(Generator)
+    order_gen.force = False
+    order_gen.done = {}
+    _fresh_c = {"id": "ch01:p0101:s0000-0001", "text": "Fresh.", "text_sha256": sha256_text("Fresh.")}
+    _retry_c = {"id": "ch01:p0102:s0000-0001", "text": "Retry me.", "text_sha256": sha256_text("Retry me.")}
+    order_gen.failed = {_retry_c["id"]: {"text_sha256": _retry_c["text_sha256"]}}
+    order_gen.plan = {"chunks": [_retry_c, _fresh_c]}  # retry listed FIRST in plan order
+    check("never-attempted chunks are ordered before failed-retry chunks",
+          [c["id"] for c in order_gen._pending_chunks()] == [_fresh_c["id"], _retry_c["id"]])
+
+    # 3. Policy-cleared promotion, no ASR: a failed chunk's retained wav,
+    # once its structural facts pass, promotes to done without calling
+    # _generate_with_retries (no new TTS call) when validation is off.
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        promote_gen = object.__new__(Generator)
+        promote_gen.out_dir = td
+        promote_gen.validate = False
+        promote_gen.done = {}
+        promote_gen._records = {}
+        promote_gen._save_records = lambda: None
+        promote_gen._save_state = lambda: None
+        ptext = "A sentence that used to fail a gate since fixed."
+        pchunk = {"id": "ch01:p0103:s0000-0001", "chapter": "ch01",
+                  "text": ptext, "text_sha256": sha256_text(ptext)}
+        pwav = td / Generator._chunk_wav_rel(pchunk)
+        pwav.parent.mkdir(parents=True, exist_ok=True)
+        _make_wav(pwav, [1, 2, 3])
+        promote_gen.failed = {pchunk["id"]: {
+            "text_sha256": pchunk["text_sha256"], "wav": Generator._chunk_wav_rel(pchunk),
+            "wav_sha256": sha256_file(pwav), "samples": 3, "seconds": 0.0001,
+            "terminal_silence_seconds": 0.0, "tail_frame_peak": 0.001,
+            "reasons": ["attempt 0: a gate that has since been fixed"],
+        }}
+        called = {"tts": False}
+        promote_gen._generate_with_retries = lambda *a, **k: called.__setitem__("tts", True)
+        promoted = promote_gen._maybe_promote_failed(pchunk)
+        check("policy-cleared take promotes to done with no TTS call (validate off)",
+              promoted and pchunk["id"] in promote_gen.done
+              and pchunk["id"] not in promote_gen.failed and not called["tts"])
+
+    # 3b. Same, but with ASR validation on: the retained wav is
+    # revalidated (mocked here to PASS, standing in for "the fix that
+    # cleared it") and promoted with no TTS call.
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        promote_gen2 = object.__new__(Generator)
+        promote_gen2.out_dir = td
+        promote_gen2.validate = True
+        promote_gen2.done = {}
+        promote_gen2._records = {}
+        promote_gen2._save_records = lambda: None
+        promote_gen2._save_state = lambda: None
+        ptext2 = "Another sentence a curated pair now covers."
+        pchunk2 = {"id": "ch01:p0104:s0000-0001", "chapter": "ch01",
+                   "text": ptext2, "text_sha256": sha256_text(ptext2)}
+        pwav2 = td / Generator._chunk_wav_rel(pchunk2)
+        pwav2.parent.mkdir(parents=True, exist_ok=True)
+        _make_wav(pwav2, [4, 5, 6])
+        promote_gen2.failed = {pchunk2["id"]: {
+            "text_sha256": pchunk2["text_sha256"], "wav": Generator._chunk_wav_rel(pchunk2),
+            "wav_sha256": sha256_file(pwav2), "samples": 3, "seconds": 0.0001,
+            "terminal_silence_seconds": 0.0, "tail_frame_peak": 0.001,
+            "reasons": ["attempt 0: mandatory missing (now a curated pair)"],
+        }}
+        class _FakeValidator:
+            def validate_many(self, specs):
+                return [dict(_pass, chunk_id=specs[0]["chunk_id"],
+                            expected_sha256=pchunk2["text_sha256"])]
+        promote_gen2._validator = lambda: _FakeValidator()
+        called2 = {"tts": False}
+        promote_gen2._generate_with_retries = lambda *a, **k: called2.__setitem__("tts", True)
+        promoted2 = promote_gen2._maybe_promote_failed(pchunk2)
+        check("policy-cleared take promotes via revalidation, no TTS call",
+              promoted2 and pchunk2["id"] in promote_gen2.done
+              and pchunk2["id"] not in promote_gen2.failed and not called2["tts"])
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        stillfail_gen = object.__new__(Generator)
+        stillfail_gen.out_dir = td
+        stillfail_gen.validate = True
+        stillfail_gen.done = {}
+        stillfail_gen._records = {}
+        stillfail_gen._save_records = lambda: None
+        stillfail_gen._save_state = lambda: None
+        ptext3 = "A sentence still wrong for an unrelated reason."
+        pchunk3 = {"id": "ch01:p0108:s0000-0001", "chapter": "ch01",
+                   "text": ptext3, "text_sha256": sha256_text(ptext3)}
+        pwav3 = td / Generator._chunk_wav_rel(pchunk3)
+        pwav3.parent.mkdir(parents=True, exist_ok=True)
+        _make_wav(pwav3, [7, 8, 9])
+        stillfail_gen.failed = {pchunk3["id"]: {
+            "text_sha256": pchunk3["text_sha256"], "wav": Generator._chunk_wav_rel(pchunk3),
+            "wav_sha256": sha256_file(pwav3), "samples": 3, "seconds": 0.0001,
+            "terminal_silence_seconds": 0.0, "tail_frame_peak": 0.001,
+            "reasons": ["attempt 0: mandatory missing (still genuinely wrong)"],
+        }}
+
+        class _StillFailValidator:
+            def validate_many(self, specs):
+                return [dict(_pass, verdict="FAIL", chunk_id=specs[0]["chunk_id"],
+                            expected_sha256=pchunk3["text_sha256"])]
+        stillfail_gen._validator = lambda: _StillFailValidator()
+        stillfail_gen._generate_with_retries = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not call the TTS in this check"))
+        check("a still-failing take (revalidation FAILs) is not promoted",
+              not stillfail_gen._maybe_promote_failed(pchunk3)
+              and pchunk3["id"] not in stillfail_gen.done
+              and pchunk3["id"] in stillfail_gen.failed)
+
+    # 4. Assembly must refuse (never silently) while any chunk is in the
+    # failed set: `_plan_complete` treats done/failed as mutually
+    # exclusive, so one unresolved failure blocks the whole book.
+    refuse_gen = object.__new__(Generator)
+    refuse_gen.out_dir = pathlib.Path(tempfile.mkdtemp())
+    rtext = "This chunk permanently failed."
+    rchunk = {"id": "ch01:p0105:s0000-0001", "chapter": "ch01",
+              "text": rtext, "text_sha256": sha256_text(rtext)}
+    refuse_gen.plan = {"chunks": [rchunk]}
+    refuse_gen.done = {}
+    refuse_gen.failed = {rchunk["id"]: {"text_sha256": rchunk["text_sha256"],
+                                        "reasons": ["attempt 0: mandatory missing"]}}
+    check("assembly refuses (plan incomplete) while a chunk is in the failed set",
+          not refuse_gen._plan_complete())
+
+    # 5. Regression: nothing changes when nothing has failed -- pending
+    # order stays exactly plan order, same as before this feature.
+    noop_gen = object.__new__(Generator)
+    noop_gen.force = False
+    noop_gen.done = {}
+    noop_gen.failed = {}
+    _c1 = {"id": "ch01:p0106:s0000-0001", "text": "One.", "text_sha256": sha256_text("One.")}
+    _c2 = {"id": "ch01:p0107:s0000-0001", "text": "Two.", "text_sha256": sha256_text("Two.")}
+    noop_gen.plan = {"chunks": [_c1, _c2]}
+    check("pending order is unchanged (plan order) when nothing has failed",
+          [c["id"] for c in noop_gen._pending_chunks()] == [_c1["id"], _c2["id"]])
+
+    # 6. Resume compatibility: a state.json written before this feature
+    # existed has no "failed" key at all -- must load as {}, not error.
+    check("absent failed key in persisted state loads as empty (resume compat)",
+          json.loads('{"done": {"x": {}}}').get("failed", {}) == {})
 
     failed = [name for name, ok in results if not ok]
     print(f"selfcheck: {len(results) - len(failed)}/{len(results)} passed")
