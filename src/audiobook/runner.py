@@ -222,19 +222,54 @@ def _chunk_identity_hash(chunk: dict) -> str:
     return sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
-def _state_plan_matches(st_plan: dict | None, plan: dict) -> bool:
-    """Return whether persisted state describes this exact source plan."""
+def _state_plan_relation(st_plan: dict | None, plan: dict) -> str:
+    """Classify how persisted ``st_plan`` relates to the freshly built
+    ``plan`` requested by this run:
+
+    - ``"match"``: identical -- same chunks, same chapters, same totals.
+    - ``"superset"``: every chunk id the stored state ever recorded is
+      still present in ``plan`` with an unchanged identity hash (text,
+      spans, clause boundaries); ``plan`` may additionally contain chunks
+      the stored state never saw (e.g. ``--chapters 1`` growing to
+      ``--chapters 1,2`` against the same ``--out``). Resuming is safe:
+      every stored ``done``/``failed`` entry still describes a real chunk
+      in this run, so nothing needs to be discarded, and the new chunks
+      simply start pending.
+    - ``"conflict"``: the planner itself changed, or some chunk id the
+      stored state recorded now has different text/boundaries (or is
+      missing from ``plan`` altogether, e.g. a narrower chapter request) --
+      reusing that stored progress would silently attach it to the wrong
+      source text, so resuming is refused (see ``Generator._load_state``).
+    """
     if not isinstance(st_plan, dict):
-        return False
+        return "conflict"
+    if st_plan.get("planner") != plan.get("planner"):
+        return "conflict"
+    st_ids = st_plan.get("chunk_ids")
+    st_hashes = st_plan.get("text_hashes")
+    if (not isinstance(st_ids, list) or not isinstance(st_hashes, list)
+            or len(st_ids) != len(st_hashes)):
+        return "conflict"
+    cur_hash_by_id = {c["id"]: _chunk_identity_hash(c) for c in plan["chunks"]}
+    for cid, h in zip(st_ids, st_hashes):
+        if cur_hash_by_id.get(cid) != h:
+            return "conflict"
     chapters = [{"id": c["id"], "title": c["title"],
                  "paragraphs": c["paragraphs"], "groups": c["groups"]}
                 for c in plan["chapters"]]
-    return (st_plan.get("planner") == plan.get("planner")
-            and st_plan.get("chunk_ids") == [c["id"] for c in plan["chunks"]]
-            and st_plan.get("text_hashes") == [_chunk_identity_hash(c) for c in plan["chunks"]]
-            and st_plan.get("total_paragraphs") == plan["total_paragraphs"]
-            and st_plan.get("total_groups") == plan["total_groups"]
-            and st_plan.get("chapters") == chapters)
+    is_exact = (st_ids == [c["id"] for c in plan["chunks"]]
+                and st_hashes == [cur_hash_by_id[c["id"]] for c in plan["chunks"]]
+                and st_plan.get("total_paragraphs") == plan["total_paragraphs"]
+                and st_plan.get("total_groups") == plan["total_groups"]
+                and st_plan.get("chapters") == chapters)
+    return "match" if is_exact else "superset"
+
+
+def _state_plan_matches(st_plan: dict | None, plan: dict) -> bool:
+    """Return whether persisted state safely resumes against this source
+    plan -- an exact match, or `plan` widening it (see
+    ``_state_plan_relation``). A genuinely conflicting plan returns False."""
+    return _state_plan_relation(st_plan, plan) in ("match", "superset")
 
 
 def _atomic_write(path: pathlib.Path, text: str) -> None:
@@ -1993,12 +2028,30 @@ def selfcheck() -> int:
                "chunk_ids": [_ca["id"], _cb["id"]],
                "text_hashes": [_chunk_identity_hash(_ca), _chunk_identity_hash(_cb)],
                "total_paragraphs": 2, "total_groups": 2}
-    check("state plan identity matches", _state_plan_matches(st_plan, cur_plan))
-    check("state plan drift (limit) detected", not _state_plan_matches(
-        dict(st_plan, chunk_ids=[_ca["id"]], text_hashes=[st_plan["text_hashes"][0]], total_groups=1), cur_plan))
-    check("state plan drift (text) detected", not _state_plan_matches(
-        dict(st_plan, text_hashes=["x", st_plan["text_hashes"][1]]), cur_plan))
-    check("state plan rejects non-plan", not _state_plan_matches(None, cur_plan))
+    check("state plan identity matches", _state_plan_matches(st_plan, cur_plan)
+          and _state_plan_relation(st_plan, cur_plan) == "match")
+    # Concern B: a stored plan that is a narrower subset of the current,
+    # WIDER plan (e.g. --chapters 1 grown to --chapters 1,2 against the
+    # same --out) is a "superset" relation, not drift -- every chunk id it
+    # ever recorded is still present with an unchanged identity hash, so
+    # resuming keeps that progress instead of erroring.
+    _narrower_st_plan = dict(st_plan, chunk_ids=[_ca["id"]],
+                             text_hashes=[st_plan["text_hashes"][0]], total_groups=1)
+    check("a plan that only widens (superset) resumes -- stored progress is not drift",
+          _state_plan_matches(_narrower_st_plan, cur_plan)
+          and _state_plan_relation(_narrower_st_plan, cur_plan) == "superset")
+    check("state plan drift (text) detected: a genuinely conflicting plan still errors",
+          not _state_plan_matches(dict(st_plan, text_hashes=["x", st_plan["text_hashes"][1]]), cur_plan)
+          and _state_plan_relation(dict(st_plan, text_hashes=["x", st_plan["text_hashes"][1]]), cur_plan)
+          == "conflict")
+    check("a narrower request than what's stored still conflicts "
+          "(never silently drops a recorded chunk from consideration)",
+          not _state_plan_matches(st_plan, dict(cur_plan, chunks=[_ca]))
+          and _state_plan_relation(st_plan, dict(cur_plan, chunks=[_ca])) == "conflict")
+    check("a planner change always conflicts, even with identical chunk ids/hashes",
+          _state_plan_relation(dict(st_plan, planner={"policy": "different"}), cur_plan) == "conflict")
+    check("state plan rejects non-plan", not _state_plan_matches(None, cur_plan)
+          and _state_plan_relation(None, cur_plan) == "conflict")
 
     original_extract = epub.extract_chapters
     epub.extract_chapters = lambda _: [
@@ -2829,6 +2882,62 @@ def selfcheck() -> int:
     # existed has no "failed" key at all -- must load as {}, not error.
     check("absent failed key in persisted state loads as empty (resume compat)",
           json.loads('{"done": {"x": {}}}').get("failed", {}) == {})
+
+    # --- integration: Generator._load_state (concerns B + C) ---------------
+    _FakeCfg = type("FakeCfg", (), {
+        "model_repo": "repo", "model_revision": "rev", "language": "English",
+        "max_tokens": 4096, "seed": 42, "asr_repo": "a-repo", "asr_revision": "a-rev",
+    })
+
+    def _make_state_gen(td, plan, fingerprint="fp-1"):
+        g = object.__new__(Generator)
+        g.out_dir = pathlib.Path(td)
+        g.state_path = g.out_dir / STATE_REL
+        g.config = _FakeCfg()
+        g.ref_wav_sha, g.ref_text_sha = "w", "t"
+        g.fingerprint = fingerprint
+        g.plan = plan
+        g.force = False
+        g.discard_done = False
+        return g
+
+    def _seed_state(td, plan, done, fingerprint="fp-1"):
+        seed = _make_state_gen(td, plan, fingerprint)
+        seed.done, seed.failed, seed.started_unix = done, {}, 0.0
+        seed._save_state()
+
+    _cc = _test_chunk("ch01:p0002:s0000-0001", "Third clause.", [27, 41],
+                       {"start": 27, "end": 41, "text": "Third clause.", "words": 2,
+                        "sentence_index": 2, "clause_index": 0})
+    _wide_plan = {"planner": _planner,
+                  "chapters": [{"id": "ch01", "title": "T", "paragraphs": 3, "groups": 3}],
+                  "chunks": [_ca, _cb, _cc], "total_paragraphs": 3, "total_groups": 3}
+    _ca_conflict = dict(_ca, text="Changed clause.", text_sha256=sha256_text("Changed clause."))
+    _conflict_plan = dict(cur_plan, chunks=[_ca_conflict, _cb])
+    _seed_done = {_ca["id"]: {"text_sha256": _ca["text_sha256"], "wav": "a.wav",
+                              "wav_sha256": "sa", "samples": 1, "seconds": 0.1,
+                              "terminal_silence_seconds": 0.0}}
+
+    with tempfile.TemporaryDirectory() as td:
+        _seed_state(td, cur_plan, _seed_done)
+        widen_gen = _make_state_gen(td, _wide_plan)
+        widen_gen._load_state()
+        check("a superset-plan resume loads without error and keeps the stored done chunk",
+              widen_gen.done.get(_ca["id"], {}).get("wav_sha256") == "sa"
+              and _cb["id"] not in widen_gen.done and _cc["id"] not in widen_gen.done)
+
+    with tempfile.TemporaryDirectory() as td:
+        _seed_state(td, cur_plan, _seed_done)
+        fp_mismatch_gen = _make_state_gen(td, cur_plan, fingerprint="fp-2")
+        check("a fingerprint mismatch (model/reference/book/seed changed) also "
+              "requires --force/--discard-done, even against an identical plan",
+              _raises(RunError, fp_mismatch_gen._load_state))
+
+    with tempfile.TemporaryDirectory() as td:
+        _seed_state(td, cur_plan, _seed_done)
+        conflict_gen = _make_state_gen(td, _conflict_plan)
+        check("a genuinely conflicting plan raises without --force/--discard-done",
+              _raises(RunError, conflict_gen._load_state))
 
     failed = [name for name, ok in results if not ok]
     print(f"selfcheck: {len(results) - len(failed)}/{len(results)} passed")
