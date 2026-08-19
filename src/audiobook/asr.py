@@ -478,6 +478,19 @@ _ROMAN_TO_CARDINAL = {
 # III" = "Part Three".
 _CARDINAL_CONTEXT_WORDS = frozenset({"War", "Part", "Chapter", "Volume", "Book", "Act"})
 
+# Bare "I" pronoun-collision guard, resolved empirically rather than by
+# guessing: grepping the WHOLE book (all 11 sections) for <CapitalizedWord>
+# I <next-token> turns up exactly 3 hits total. Two are the regnal hazard
+# this function exists to fix ("...the urgency with which Elizabeth I
+# constructed the Anglican via media..." in ch02; "...the imperial legacy
+# of Abbas I had been summarily dissolved" in ch03). One is a genuine
+# first-person pronoun: "Thus I have used Constantinople and not
+# Istanbul..." (the "names" front-matter section) -- "Thus" is a sentence
+# adverb, not a name, immediately followed by its own subject "I". This is
+# the ONLY connective word the grep actually found in this position, so
+# it is the only one excluded; nothing else is guessed at.
+_PRONOUN_CONTEXT_WORDS = frozenset({"Thus"})
+
 _REGNAL_NUMERAL_RE = re.compile(
     r"\b([A-Z][a-zA-Z]*)\s+(I|II|III|IV|V|VI|VII|VIII|IX|X)\b([.,;:]?)"
 )
@@ -500,15 +513,18 @@ def normalize_for_tts(text: str) -> str:
       "Part III" -> "Part Three" -- English reads these as counts, not
       regnal ordinals.
 
-    "I" specifically only fires when immediately followed by punctuation
-    (comma/period/semicolon/colon): a bare "I" collides with the
-    first-person pronoun ("Mary I know" has no punctuation after "I" and
-    is left alone), but "Abbas I," or "Abbas I." is unambiguous. II-X have
-    no such collision and fire on the pattern alone.
+    "I" specifically fires when followed by punctuation (comma/period/
+    semicolon/colon) OR a lowercase word ("Elizabeth I constructed" ->
+    "Elizabeth the First constructed"), UNLESS the preceding word is in
+    _PRONOUN_CONTEXT_WORDS -- a bare "I" collides with the first-person
+    pronoun, and a whole-book grep found exactly one word where that
+    collision actually occurs ("Thus I have used..."), so that is the only
+    exclusion; nothing else is guessed at. II-X have no such collision and
+    fire on the pattern alone.
     """
     def repl(m):
         word, numeral, punct = m.group(1), m.group(2), m.group(3)
-        if numeral == "I" and not punct:
+        if numeral == "I" and not punct and word in _PRONOUN_CONTEXT_WORDS:
             return m.group(0)
         cardinal = word in _CARDINAL_CONTEXT_WORDS
         table = _ROMAN_TO_CARDINAL if cardinal else _ROMAN_TO_ORDINAL
@@ -2624,10 +2640,26 @@ def selfcheck() -> int:
     check("Part III becomes Part Three (cardinal exclusion list)",
           normalize_for_tts("Part III covers the aftermath.") ==
           "Part Three covers the aftermath.")
-    check("pronoun guard: 'Mary I know' unchanged (no punctuation after I)",
-          normalize_for_tts("Mary I know is not the same person.") ==
-          "Mary I know is not the same person.")
-    check("pronoun guard: '...and I said' unchanged",
+    # Bare "I" not followed by punctuation now fires too (Elizabeth I
+    # constructed -> Elizabeth the First constructed), resolved against a
+    # whole-book grep rather than a guess -- see _PRONOUN_CONTEXT_WORDS.
+    check("Elizabeth I constructed becomes Elizabeth the First constructed",
+          normalize_for_tts(
+              "the urgency with which Elizabeth I constructed the Anglican "
+              "via media in England.") ==
+          "the urgency with which Elizabeth the First constructed the "
+          "Anglican via media in England.")
+    check("Abbas I had been becomes Abbas the First had been (ch03 occurrence)",
+          normalize_for_tts("the imperial legacy of Abbas I had been summarily dissolved.") ==
+          "the imperial legacy of Abbas the First had been summarily dissolved.")
+    check("the one genuine pronoun context the grep found stays unchanged",
+          normalize_for_tts(
+              "Thus I have used Constantinople and not Istanbul throughout.") ==
+          "Thus I have used Constantinople and not Istanbul throughout.")
+    check("genuine pronoun context, synthesized (sentence-initial 'I argue')",
+          normalize_for_tts("Thus I argue that this changed everything.") ==
+          "Thus I argue that this changed everything.")
+    check("pronoun guard: '...and I said' unchanged (lowercase 'and' never matches)",
           normalize_for_tts("...and I said nothing at all.") ==
           "...and I said nothing at all.")
     check("plain text with no numerals is byte-identical",
