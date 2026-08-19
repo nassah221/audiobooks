@@ -67,7 +67,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v28-accent-folding"
+VALIDATION_POLICY = "paragraph-v29-ambiguous-number-variants"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -341,8 +341,12 @@ def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def tokenize(text: str) -> list:
-    """Normalize spoken and written text into comparable tokens."""
+def _tokenize_pre_merge(text: str) -> list:
+    """Shared preprocessing for tokenize()'s merge-chain orderings:
+    lowercase, accent-fold, numeral/ordinal normalization, per-word number
+    conversion, and digit-run merging. Returns the token list just before
+    the final century/decade/thousand merge passes, which is where the two
+    readings in `tokenize_variants` diverge."""
     t = text.lower().replace("\u2019", "'")
     # Fold accented Latin letters to their base ASCII form (e/e/i/i/a/a/..
     # for e,\u00e9,i,\u00ed,a,\u00e2,..) before the punctuation-stripping
@@ -391,10 +395,59 @@ def tokenize(text: str) -> list:
             merged.append(tok)
     if run:
         merged.append("".join(run))
+    return merged
+
+
+def tokenize(text: str) -> list:
+    """Normalize spoken and written text into comparable tokens.
+
+    "N hundred and M thousand" reads as two separate numbers joined by
+    "and" ("between five hundred and one thousand" = 500, 1000) --
+    `tokenize_variants` also tries the reverse merge order for the
+    alternate "one compound number" reading ("one hundred and fifty
+    thousand" = 150000), since both are genuine, ambiguous-in-text-alone
+    parses of the same words.
+    """
+    merged = _tokenize_pre_merge(text)
     return _canonicalize_bare_decades(
         _merge_century_remainder_tokens(
             _merge_thousand_tokens(
                 _merge_hundreds_decade_tokens(_merge_century_tokens(_merge_decade_tokens(merged))))))
+
+
+def _tokenize_compound_thousand(text: str) -> list:
+    """Alternate reading for the "<hundred-multiple> and <remainder>
+    thousand" shape: combine the hundred-and-remainder into one number
+    BEFORE multiplying by thousand ("one hundred and fifty thousand" =
+    150000) -- the reverse merge order from `tokenize`'s own "two numbers
+    joined by 'and'" reading. Both are faithful parses of the same source
+    words; see `tokenize_variants`, which callers should use instead of
+    this directly."""
+    merged = _tokenize_pre_merge(text)
+    return _canonicalize_bare_decades(
+        _merge_thousand_tokens(
+            _merge_century_remainder_tokens(
+                _merge_hundreds_decade_tokens(_merge_century_tokens(_merge_decade_tokens(merged))))))
+
+
+def tokenize_variants(text: str) -> list:
+    """All tokenizations of `text` under readings the source words support.
+
+    Normally exactly one (`tokenize`'s own result). A "<hundred-multiple>
+    and <remainder> thousand" shape is genuinely ambiguous in the text
+    alone: "one hundred and fifty thousand" is one compound number
+    (150,000), while "between five hundred and one thousand" is two
+    numbers (500, 1000) joined by the same word "and" -- identical token
+    shape, opposite grouping. It is NOT ambiguous in the audio: the TTS
+    spoke one specific reading and Whisper transcribed what it heard, so
+    whichever variant matches the transcript proves those words were
+    spoken. Callers (the lexical gates) should accept a match under EITHER
+    variant rather than guess the grouping at tokenize time."""
+    default = tokenize(text)
+    compound = _tokenize_compound_thousand(text)
+    if compound != default:
+        return [default, compound]
+    return [default]
 
 
 
@@ -1468,22 +1521,40 @@ class AsrValidator:
         segments = result.get("segments") or []
         transcript = (result.get("text") or "").strip()
         asr_tokens = tokenize(transcript)
-        expected_tokens = tokenize(expected_text)
         word_timings = normalized_word_timings(segments)
-        mand_items = derive_mandatory(expected_tokens, expected_text) if mandatory is None else mandatory
-        mandatory_result = check_mandatory(asr_tokens, mand_items)
-        phonetic_matches = mandatory_result.get("phonetic_matches")
-        metrics = {
-            "coverage": ordered_coverage(expected_tokens, asr_tokens, phonetic_matches),
-            "mandatory": mandatory_result,
-            "terminal": terminal_suffix(expected_tokens, asr_tokens, phonetic_matches=phonetic_matches),
-            "confidence": _confidence(segments),
-            "repetition": repetition_stats(asr_tokens, expected_tokens),
-            "leakage": leakage_check(asr_tokens, leakage_texts or []),
-            "words": _word_stats(segments),
-            "punctuation": punctuation_metrics(expected_text, word_timings),
-        }
-        v, reasons = verdict(metrics)
+        # tokenize_variants: normally one reading, but a "<hundred-multiple>
+        # and <remainder> thousand" shape is genuinely ambiguous in the text
+        # alone (one compound number vs. two numbers joined by "and" -- see
+        # tokenize_variants's docstring). Try the default ("separate")
+        # reading first, then the alternate ("compound") one only if it
+        # exists; keep whichever passes, or the default's result if neither
+        # does, so a real failure is still reported against the primary
+        # reading.
+        expected_variants = tokenize_variants(expected_text)
+        variant_labels = ("separate", "compound")
+        metrics = v = reasons = number_parse = None
+        for i, expected_tokens in enumerate(expected_variants):
+            mand_items = derive_mandatory(expected_tokens, expected_text) if mandatory is None else mandatory
+            mandatory_result = check_mandatory(asr_tokens, mand_items)
+            phonetic_matches = mandatory_result.get("phonetic_matches")
+            candidate_metrics = {
+                "coverage": ordered_coverage(expected_tokens, asr_tokens, phonetic_matches),
+                "mandatory": mandatory_result,
+                "terminal": terminal_suffix(expected_tokens, asr_tokens, phonetic_matches=phonetic_matches),
+                "confidence": _confidence(segments),
+                "repetition": repetition_stats(asr_tokens, expected_tokens),
+                "leakage": leakage_check(asr_tokens, leakage_texts or []),
+                "words": _word_stats(segments),
+                "punctuation": punctuation_metrics(expected_text, word_timings),
+            }
+            candidate_v, candidate_reasons = verdict(candidate_metrics)
+            if metrics is None:
+                metrics, v, reasons, number_parse = (
+                    candidate_metrics, candidate_v, candidate_reasons, variant_labels[i])
+            if candidate_v == "PASS":
+                metrics, v, reasons, number_parse = (
+                    candidate_metrics, candidate_v, candidate_reasons, variant_labels[i])
+                break
         record = {
             "chunk_id": chunk_id,
             "wav_sha256": wav_sha,
@@ -1501,6 +1572,7 @@ class AsrValidator:
             "words": metrics["words"],
             "word_timings": word_timings,
             "punctuation": metrics["punctuation"],
+            "number_parse": number_parse,
             "signal": signal,
             "verdict": v,
             "reasons": reasons,
@@ -1700,6 +1772,52 @@ def selfcheck() -> int:
                           ["two thousand five hundred"])["missing"] == [])
     check("thousand plus a non-hundred remainder stays unmerged",
           tokenize("two thousand fifty") != tokenize("2050"))
+
+    # v29: "<hundred-multiple> and <remainder> thousand" is genuinely
+    # ambiguous in the text alone -- "one hundred and fifty thousand" is
+    # one compound number (150,000), "between five hundred and one
+    # thousand" is two numbers (500, 1000) joined by the same word "and".
+    # Not ambiguous in the audio, though: whichever variant matches the
+    # transcript proves those exact words were spoken, so the lexical
+    # gates try both and accept either.
+    check("unambiguous number produces exactly one variant",
+          len(tokenize_variants("two thousand miles")) == 1)
+    check("ordinary sentence produces exactly one variant",
+          len(tokenize_variants("The death of Tamerlane in 1405.")) == 1)
+    compound_variants = tokenize_variants("some one hundred and fifty thousand white Spanish.")
+    check("ambiguous shape produces exactly two variants",
+          len(compound_variants) == 2, repr(compound_variants))
+    compound_asr = tokenize("some 150,000 white Spanish.")
+    compound_passed = False
+    for exp in compound_variants:
+        mand = derive_mandatory(exp, "some one hundred and fifty thousand white Spanish.")
+        mres = check_mandatory(compound_asr, mand)
+        if (mres["missing"] == [] and
+                ordered_coverage(exp, compound_asr, mres["phonetic_matches"])["missing"] == [] and
+                terminal_suffix(exp, compound_asr, phonetic_matches=mres["phonetic_matches"])["matched"]):
+            compound_passed = True
+    check("compound reading (150,000) passes under some variant", compound_passed)
+    range_variants = tokenize_variants("between five hundred and one thousand.")
+    range_asr = tokenize("between 500 and 1000.")
+    range_passed = False
+    for exp in range_variants:
+        mand = derive_mandatory(exp, "between five hundred and one thousand.")
+        mres = check_mandatory(range_asr, mand)
+        if (mres["missing"] == [] and
+                ordered_coverage(exp, range_asr, mres["phonetic_matches"])["missing"] == [] and
+                terminal_suffix(exp, range_asr, phonetic_matches=mres["phonetic_matches"])["matched"]):
+            range_passed = True
+    check("separate reading (500 and 1000) passes under some variant", range_passed)
+    wrong_asr = tokenize("some 80,000 white Spanish.")
+    wrong_passed = False
+    for exp in compound_variants:
+        mand = derive_mandatory(exp, "some one hundred and fifty thousand white Spanish.")
+        mres = check_mandatory(wrong_asr, mand)
+        if (mres["missing"] == [] and
+                ordered_coverage(exp, wrong_asr, mres["phonetic_matches"])["missing"] == [] and
+                terminal_suffix(exp, wrong_asr, phonetic_matches=mres["phonetic_matches"])["matched"]):
+            wrong_passed = True
+    check("a genuinely different number fails under every variant", not wrong_passed)
 
     # v28: an accented Latin letter is a letter, not punctuation -- fold it
     # to its base ASCII form (NFKD decompose, drop combining marks) instead
