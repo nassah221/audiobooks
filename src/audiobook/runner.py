@@ -800,6 +800,13 @@ class Generator:
         # stale from counting as done). discard_done is the explicit,
         # loud opt-in to actually zero it.
         self.discard_done = discard_done
+        # Set True only by _load_state's mismatch-carry-forward branch
+        # (--force used to escape a mismatch, not --discard-done). Distinct
+        # from `self.force` itself: `force` ALSO means "regenerate every
+        # chunk" when the state already matches (see _pending_chunks), and
+        # that full-regen behavior must NOT apply to a carried-forward set
+        # -- carried entries that still validate are done, no TTS call.
+        self._mismatch_force_carry = False
         self.validate = validate
         self.offline = offline
         self.config = config if config is not None else load_config(self.root)
@@ -923,6 +930,11 @@ class Generator:
                     # plan simply won't count as done (_unit_done checks
                     # text_sha256 per chunk), so nothing stale is reused.
                     self.done, self.failed = old_done, old_failed
+                    # Carried-forward entries must be re-admitted as done
+                    # by the normal _is_done check, NOT wiped by force's
+                    # other meaning ("regenerate everything" on an
+                    # already-matching state) -- see _pending_chunks.
+                    self._mismatch_force_carry = True
                     print(
                         f"  --force: state mismatch archived to {archived.name}; "
                         f"carrying forward {len(old_done)} previously-done chunk(s) and "
@@ -976,7 +988,18 @@ class Generator:
         return any(child["id"] in self.failed for child in self._child_chunks(chunk))
 
     def _pending_chunks(self):
-        if self.force:
+        # `force` has two distinct meanings that must not collapse into
+        # one: (1) the state already matched and --force means "regenerate
+        # everything" (the documented, pre-existing behavior -- full
+        # invalidation below); (2) _load_state hit a mismatch and --force
+        # only archived + carried the old done/failed set forward (see
+        # _mismatch_force_carry) -- there, carried entries that still
+        # validate against THIS plan are done, exactly like a normal
+        # resume, and only genuinely new/changed chunks are pending.
+        # getattr guard: minimal test doubles built with
+        # object.__new__(Generator) predate this flag and never set it;
+        # absent means "not a mismatch carry-forward", i.e. plain force.
+        if self.force and not getattr(self, "_mismatch_force_carry", False):
             for parent in self.plan["chunks"]:
                 if parent["id"] not in self._forced_parents:
                     self._invalidate_forced_parent(parent)
@@ -3054,6 +3077,7 @@ def selfcheck() -> int:
         g.plan = plan
         g.force = False
         g.discard_done = False
+        g._mismatch_force_carry = False
         return g
 
     def _seed_state(td, plan, done, fingerprint="fp-1"):
@@ -3118,6 +3142,56 @@ def selfcheck() -> int:
         discard_gen._load_state()
         check("--discard-done explicitly zeroes done after archiving (never silent)",
               discard_gen.done == {} and (force_gen.out_dir / "state.json.bak-2").is_file())
+
+    # Regression: --force on a mismatch must not fall into force's OTHER
+    # meaning ("regenerate everything", for an already-matching state) --
+    # a carried-forward chunk with an intact wav and a PASSing validation
+    # record has to be re-admitted as done by the normal _is_done check,
+    # not wiped by _pending_chunks's unconditional full-regen branch. Seen
+    # in production: --force on an old-schema state.json logged "carrying
+    # forward 248 ... chunk(s)" but then regenerated 251 of 255 anyway,
+    # because _pending_chunks checked only `self.force`, not WHY it was
+    # set.
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        wav_a = td / "chunks" / "ch01" / (_ca["id"].replace(":", "-") + ".wav")
+        wav_b = td / "chunks" / "ch01" / (_cb["id"].replace(":", "-") + ".wav")
+        wav_a.parent.mkdir(parents=True, exist_ok=True)
+        _make_wav(wav_a, [1, 2, 3])
+        _make_wav(wav_b, [4, 5, 6])
+        old_done = {
+            _ca["id"]: {"text_sha256": _ca["text_sha256"], "wav": str(wav_a.relative_to(td)),
+                       "wav_sha256": sha256_file(wav_a), "samples": 3, "seconds": 0.1,
+                       "terminal_silence_seconds": 0.0},
+            _cb["id"]: {"text_sha256": _cb["text_sha256"], "wav": str(wav_b.relative_to(td)),
+                       "wav_sha256": sha256_file(wav_b), "samples": 3, "seconds": 0.1,
+                       "terminal_silence_seconds": 0.0},
+        }
+        # An "old-schema" state: a fingerprint this run's code will never
+        # produce (concern A narrowed run_fingerprint), and a "plan" shape
+        # irrelevant to matching once the fingerprint itself disagrees.
+        _atomic_write_json(td / STATE_REL, {
+            "fingerprint": "old-schema-fp", "plan": {"planner": {"policy": "old"}},
+            "done": old_done, "failed": {}, "started_unix": 0.0,
+        })
+
+        carry_gen = _make_state_gen(str(td), _wide_plan, fingerprint="new-fp")
+        carry_gen.force = True
+        carry_gen.validate = True
+        carry_gen._records = {_ca["id"]: dict(_pass), _cb["id"]: dict(_pass)}
+        carry_gen._forced_parents = set()
+        carry_gen._load_state()
+        check("--force on a mismatch carries the old done set into self.done",
+              carry_gen.done.get(_ca["id"], {}).get("wav_sha256")
+              == old_done[_ca["id"]]["wav_sha256"]
+              and carry_gen._mismatch_force_carry is True)
+
+        pending_ids = [c["id"] for c in carry_gen._pending_chunks()]
+        check("a carried-forward chunk with an intact wav and a PASSing record "
+              "is NOT regenerated (the production bug this reproduces)",
+              _ca["id"] not in pending_ids and _cb["id"] not in pending_ids)
+        check("only the genuinely new chunk introduced by the widened plan is pending",
+              pending_ids == [_cc["id"]])
 
     # --- concern D: selective regeneration ----------------------------------
     with tempfile.TemporaryDirectory() as td:
