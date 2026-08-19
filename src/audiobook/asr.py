@@ -67,7 +67,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v31-regnal-numeral-speak-text"
+VALIDATION_POLICY = "paragraph-v32-q-k-phonetic-skeleton"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -1045,12 +1045,21 @@ def _phonetic_skeleton(word: str) -> str:
     """Collapse a word to a coarse consonant skeleton so common digraph and
     vowel-spelling differences ("decentre" / "dissenter") fall out: lowercase,
     map digraphs towards their sound (ph->f, gh (silent) -> dropped, ck->k,
-    c->s before e/i else k, x->ks), collapse doubled letters, then drop
-    vowels except a leading one (which carries the word's opening sound)."""
+    q->k, c->s before e/i else k, x->ks), collapse doubled letters, then
+    drop vowels except a leading one (which carries the word's opening
+    sound).
+
+    q->k (v32): "qullars" (a Persian/Ottoman administrative loanword,
+    transliterated with a q) is /k/, the same phoneme as "colors"'s c --
+    q was left as a distinct letter, so "qullars" (klrs after this fix)
+    and Whisper's "colors" (klrs already, since c->k) never matched before
+    this: q and k denote the same sound in English, so this is filling a
+    gap in an existing rule, not a new tolerance."""
     w = word.lower()
     w = w.replace("ph", "f")
     w = w.replace("gh", "")
     w = w.replace("ck", "k")
+    w = w.replace("q", "k")
     w = _PHONETIC_C_BEFORE_EI_RE.sub("s", w)
     w = w.replace("c", "k")
     w = w.replace("x", "ks")
@@ -1079,13 +1088,20 @@ def _levenshtein(a: str, b: str) -> int:
 def _phonetic_match(word: str, candidate: str) -> bool:
     """True when `candidate` is a plausible ASR mishearing of `word`: same
     (or off-by-one, for long-enough skeletons) phonetic skeleton, the same
-    first letter, and comparable raw length. All three must hold -- this is
-    the precision guard against demoting a genuine content miss."""
+    onset sound, and comparable raw length. All three must hold -- this is
+    the precision guard against demoting a genuine content miss.
+
+    The onset check compares the SKELETON's first letter, not the raw
+    word's: a digraph fold (ph->f, q->k, ...) can change a word's onset
+    letter without changing its onset sound ("qullars" raw-starts with q,
+    sounds like k, same as "colors") -- comparing raw first letters would
+    reject that pair even though _phonetic_skeleton already normalizes
+    both to "klrs"."""
     if not word or not candidate or word == candidate:
         return False
-    if word[0] != candidate[0]:
-        return False
     w_skel, c_skel = _phonetic_skeleton(word), _phonetic_skeleton(candidate)
+    if not w_skel or not c_skel or w_skel[0] != c_skel[0]:
+        return False
     if w_skel == c_skel:
         pass
     elif len(w_skel) >= 4 and len(c_skel) >= 4 and _levenshtein(w_skel, c_skel) <= 1:
@@ -2122,6 +2138,29 @@ def selfcheck() -> int:
     check("europe swapped for the unrelated erode stays hard-mandatory",
           check_mandatory(tokenize("the attempt to decentre erode entirely"),
                           ["europe"])["missing"] == ["europe"])
+
+    # v32: q and k are the same phoneme ("qullars" is /'kulɑrz/), but the
+    # skeleton normalizer left q as a distinct letter -- "qullars" (klrs
+    # after this fix) and Whisper's mishearing "colors" (klrs already,
+    # since c->k) never matched before this. Filling a gap in an existing
+    # rule, not a new tolerance: v12's demotion now fires with no
+    # rule-loosening, same as any other phonetic-match case.
+    check("qullars matches its real mishearing colors (q/k skeleton fold)",
+          _phonetic_match("qullars", "colors"))
+    check("qullars does not match the unrelated-onset mishearing kulas",
+          not _phonetic_match("qullars", "kulas"))
+    check("existing decentre/dissenter phonetic match is unaffected by the q/k fold",
+          _phonetic_match("decentre", "dissenter") and
+          not _phonetic_match("decentre", "demolish") and
+          not _phonetic_match("europe", "erode"))
+    qullars_asr = tokenize(
+        "he recruited an army and bureaucracy of colors, or golemani.")
+    qullars_mand = ["recruited", "bureaucracy", "qullars", "gholamani"]
+    qullars_check = check_mandatory(qullars_asr, qullars_mand)
+    check("qullars/colors is not hard-mandatory and is recorded for the morning audit",
+          qullars_check["missing"] == [] and
+          qullars_check["phonetic_matches"].get("qullars") == "colors",
+          repr(qullars_check))
 
     # v25: coverage/terminal must not contradict a phonetic match the
     # mandatory gate already made and recorded -- no new fuzzy comparison,
