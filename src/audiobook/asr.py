@@ -67,7 +67,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v32-q-k-phonetic-skeleton"
+VALIDATION_POLICY = "paragraph-v33-asr-fragile-lexicon"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -1120,6 +1120,48 @@ def _find_phonetic_match(word: str, asr: list) -> str:
     return None
 
 
+# Curated ASR-fragile lexicon (v33): words the book has empirically proven
+# Whisper cannot spell, same family as v8's bare-digit demotion but for
+# specific rare vocabulary rather than a structural token class. Matching
+# (_find_lexicon_match) is more permissive than the general phonetic-match
+# tolerance (_find_phonetic_match): same skeleton onset, skeleton edit
+# distance <= 2, not exact-or-<=1-with-a-length-floor -- safe only because
+# the lexicon is small, curated, and evidence-gated per word, never a
+# blanket loosening of the general mechanism.
+#
+# Self-extension lane, ALL conditions required: (1) the word is a rare
+# loanword/proper term >= 6 chars; (2) at least 2 DISTINCT garbles of it
+# have been observed across independent draws with the surrounding
+# context otherwise exact; (3) each addition is its own tiny commit
+# citing the garbles; (4) every fire lands in the validation record
+# (`lexicon_matches`) for morning audit. Anything short of all four stops
+# the line for a decision, same as before this lane existed.
+#
+# Seeded from ch02:p0055 -- "qullars" (a Persian/Ottoman administrative
+# loanword) garbled three distinct ways across independent draws, context
+# exact every time: "colors" (v32's q->k skeleton fold already catches
+# this one exactly, skeleton "klrs" both), "Kulas" (missing the r sound:
+# skeleton "kls", only 3 characters, below _find_phonetic_match's >= 4-char
+# tolerance floor), "Gula Mani" (a different occurrence's garble, split
+# into two words).
+_ASR_FRAGILE_LEXICON = frozenset({"qullars"})
+
+
+def _find_lexicon_match(word: str, asr: list) -> str:
+    """First ASR token sharing `word`'s skeleton onset with skeleton edit
+    distance <= 2, or None. Only ever called for a word in
+    `_ASR_FRAGILE_LEXICON` -- see that set's comment for why this wider
+    tolerance is safe there but not as a general rule."""
+    w_skel = _phonetic_skeleton(word)
+    if not w_skel:
+        return None
+    for candidate in asr:
+        c_skel = _phonetic_skeleton(candidate)
+        if c_skel and c_skel[0] == w_skel[0] and _levenshtein(w_skel, c_skel) <= 2:
+            return candidate
+    return None
+
+
 def _concat_match(phrase: list, asr: list) -> str:
     """Exact hyphen-boundary match for a mandatory item, in either
     direction: adjacent ASR tokens concatenating to equal a single-token
@@ -1211,6 +1253,7 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
     hyphen_matches = {}
     vowel_matches = {}
     transliteration_matches = {}
+    lexicon_matches = {}
     for item in mandatory:
         raw_phrase = item if isinstance(item, str) else " ".join(map(str, item))
         phrase = tokenize(raw_phrase)
@@ -1240,10 +1283,24 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
                 missing_fragile.append(label)
                 phonetic_matches[label] = match
                 continue
+            if phrase[0] in _ASR_FRAGILE_LEXICON:
+                lmatch = _find_lexicon_match(phrase[0], asr)
+                if lmatch:
+                    missing_fragile.append(label)
+                    # Also recorded into phonetic_matches: v25's coverage/
+                    # terminal propagation reads that field, and a curated
+                    # lexicon hit deserves the same positional match there
+                    # as any other phonetic acceptance -- lexicon_matches
+                    # is the separate, audit-clear record of which specific
+                    # fires came from the curated list.
+                    phonetic_matches[label] = lmatch
+                    lexicon_matches[label] = lmatch
+                    continue
         missing.append(label)
     return {"items": items, "missing": missing, "missing_fragile": missing_fragile,
             "phonetic_matches": phonetic_matches, "hyphen_matches": hyphen_matches,
-            "vowel_matches": vowel_matches, "transliteration_matches": transliteration_matches}
+            "vowel_matches": vowel_matches, "transliteration_matches": transliteration_matches,
+            "lexicon_matches": lexicon_matches}
 
 
 def terminal_suffix(expected: list, asr: list, size: int = 5, phonetic_matches: dict = None) -> dict:
@@ -2161,6 +2218,37 @@ def selfcheck() -> int:
           qullars_check["missing"] == [] and
           qullars_check["phonetic_matches"].get("qullars") == "colors",
           repr(qullars_check))
+
+    # v33: curated ASR-fragile lexicon. "colors" already passes via the
+    # general v12 mechanism (exact skeleton match after v32's q->k fold);
+    # "Kulas" needs the lexicon specifically, since its skeleton ("kls",
+    # missing the r sound) is only 3 characters -- below
+    # _find_phonetic_match's >= 4-char tolerance floor.
+    kulas_expected = tokenize(
+        "more than half the Safavid provinces were ruled by qullars.")
+    kulas_asr = tokenize(
+        "more than half the Safavid provinces were ruled by Kulas.")
+    kulas_mand = derive_mandatory(kulas_expected,
+                                  "more than half the Safavid provinces were ruled by qullars.")
+    kulas_check = check_mandatory(kulas_asr, kulas_mand)
+    check("qullars/Kulas passes via the curated lexicon (v12 alone can't reach it)",
+          kulas_check["missing"] == [] and
+          kulas_check["missing_fragile"] == ["qullars"] and
+          kulas_check["lexicon_matches"] == {"qullars": "kulas"} and
+          kulas_check["phonetic_matches"].get("qullars") == "kulas",
+          repr(kulas_check))
+    kulas_cov = ordered_coverage(kulas_expected, kulas_asr, kulas_check["phonetic_matches"])
+    kulas_term = terminal_suffix(kulas_expected, kulas_asr,
+                                 phonetic_matches=kulas_check["phonetic_matches"])
+    check("qullars/Kulas passes coverage and the terminal-phrase gate",
+          kulas_cov["missing"] == [] and kulas_term["matched"],
+          repr((kulas_cov, kulas_term)))
+    check("qullars still hard-fails against an unrelated word in its slot",
+          check_mandatory(tokenize("provinces were ruled by governors."),
+                          ["qullars"])["missing"] == ["qullars"])
+    check("a non-lexicon rare word is unaffected by the wider lexicon tolerance",
+          check_mandatory(tokenize("a conscious attempt to demolish europe"),
+                          ["decentre"])["missing"] == ["decentre"])
 
     # v25: coverage/terminal must not contradict a phonetic match the
     # mandatory gate already made and recorded -- no new fuzzy comparison,
