@@ -495,15 +495,39 @@ _REGNAL_NUMERAL_RE = re.compile(
     r"\b([A-Z][a-zA-Z]*)\s+(I|II|III|IV|V|VI|VII|VIII|IX|X)\b([.,;:]?)"
 )
 
+# Publisher-EPUB text defects: exact known-bad strings, fixed at speak-time
+# only. "entrepô t" / "entrepoô t" (a stray space splitting "entrepôt" into
+# two tokens) is a genuine typo in the source EPUB HTML itself, not an
+# artifact of our extraction -- confirmed directly in
+# extracted/OEBPS/html/ch02d.html etc., 9 occurrences across chapters 2-6
+# (chapter 1 is clean). The durable fix is correcting extraction so the
+# text itself is right, but that changes text_sha256/plan identity for
+# every affected paragraph, so it must happen only at a full-book
+# regeneration boundary, never mid-run (the same trap as the --chapters
+# incident earlier this session). These are exact string replacements,
+# not a pattern -- two specific known-bad strings, not a general class.
+_TEXT_DEFECT_FIXES = {
+    "entrepô t": "entrepôt",
+    "entrepoô t": "entrepôt",
+}
+
+
+def _fix_text_defects(text: str) -> str:
+    for bad, good in _TEXT_DEFECT_FIXES.items():
+        text = text.replace(bad, good)
+    return text
+
 
 def normalize_for_tts(text: str) -> str:
-    """Speak-time-only substitution for the "Name/War/Part + roman numeral"
-    hazard (see module comment above). NEVER changes plan identity, chunk
-    ids, or text_sha256 -- callers apply this only at the point text is
-    handed to the TTS, and symmetrically as the ASR comparison's expected
-    text (that is what was actually spoken); the chunk's own `text` field
-    stays the untouched original everywhere else (plan hashing,
-    `derive_mandatory`, state.json).
+    """Speak-time-only substitution for two hazards: known publisher-EPUB
+    text defects (_TEXT_DEFECT_FIXES, exact strings), and the "Name/War/
+    Part + roman numeral" mispronunciation hazard (see module comment
+    above). NEVER changes plan identity, chunk ids, or text_sha256 --
+    callers apply this only at the point text is handed to the TTS, and
+    symmetrically as the ASR comparison's expected text (that is what was
+    actually spoken); the chunk's own `text` field stays the untouched
+    original everywhere else (plan hashing, `derive_mandatory`,
+    state.json).
 
     Two readings of "Word + roman numeral":
     - Regnal ordinal (default): "Abbas I" -> "Abbas the First", "Suleiman
@@ -522,6 +546,8 @@ def normalize_for_tts(text: str) -> str:
     exclusion; nothing else is guessed at. II-X have no such collision and
     fire on the pattern alone.
     """
+    text = _fix_text_defects(text)
+
     def repl(m):
         word, numeral, punct = m.group(1), m.group(2), m.group(3)
         if numeral == "I" and not punct and word in _PRONOUN_CONTEXT_WORDS:
@@ -2794,6 +2820,27 @@ def selfcheck() -> int:
           "The death of Tamerlane in 1405.")
     check("bare 'I.' after a name still fires (punctuation present)",
           normalize_for_tts("Meet Agent I.") == "Meet Agent the First.")
+
+    # Publisher-EPUB text defect fix: "entrepô t" / "entrepoô t" (a stray
+    # space splitting "entrepôt" into two tokens, a genuine typo in the
+    # source EPUB HTML, confirmed in extracted/OEBPS/html/ch02d.html etc.)
+    # rewritten to the correct word at speak-time only.
+    check("'entrepô t' (observed form 1) rewrites to the correct word",
+          normalize_for_tts(
+              "continued to be the great cultural entrepô t of the Islamic world.") ==
+          "continued to be the great cultural entrepôt of the Islamic world.")
+    check("'entrepoô t' (observed form 2) rewrites to the correct word",
+          normalize_for_tts("a great cultural entrepoô t.") ==
+          "a great cultural entrepôt.")
+    check("already-correct 'entrepôt' is untouched",
+          normalize_for_tts("this uses the correct entrepôt spelling.") ==
+          "this uses the correct entrepôt spelling.")
+    check("entrepot fix + tokenize gives a single, accent-folded token",
+          "entrepot" in tokenize(normalize_for_tts(
+              "continued to be the great cultural entrepô t of the Islamic world.")))
+    check("text without the defect is byte-identical",
+          normalize_for_tts("The death of Tamerlane in 1405.") ==
+          "The death of Tamerlane in 1405.")
 
     try:
         import numpy as np  # noqa: F401

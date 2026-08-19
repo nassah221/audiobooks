@@ -2203,6 +2203,18 @@ def selfcheck() -> int:
           and _regnal_chunk["text_sha256"] == sha256_text(_regnal_text)
           and _regnal_chunk["text_sha256"] != sha256_text(asr.normalize_for_tts(_regnal_text)))
 
+    # Same trap, for the publisher-EPUB text-defect fix specifically: fixing
+    # extraction so "entrepô t" reads correctly everywhere would change
+    # text_sha256 for every affected paragraph (a full-book regeneration
+    # boundary concern, not tonight's); the speak-time-only fix must not.
+    _entrepot_text = "continued to be the great cultural entrepô t of the Islamic world."
+    _entrepot_chunk = _test_chunk("ch02:p0057:s0000-0001", _entrepot_text,
+                                  [0, len(_entrepot_text)], _span_a)
+    check("plan-identity fields are untouched by the entrepot text-defect fix",
+          _entrepot_chunk["text"] == _entrepot_text
+          and _entrepot_chunk["text_sha256"] == sha256_text(_entrepot_text)
+          and _entrepot_chunk["text_sha256"] != sha256_text(asr.normalize_for_tts(_entrepot_text)))
+
     failed = [name for name, ok in results if not ok]
     print(f"selfcheck: {len(results) - len(failed)}/{len(results)} passed")
     return 1 if failed else 0
