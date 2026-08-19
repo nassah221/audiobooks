@@ -571,9 +571,80 @@ def _rewrite_circa(text: str) -> str:
     return "".join(out)
 
 
+# Glued number+word defect ("350ships", "80per", "600miles", "1739a"): a
+# missing space in the raw EPUB between a digit run and the following
+# word, in the SAME family as the entrepot/circa defects but a different
+# shape and much wider spread (confirmed across ch02, ch03, ch05b, ch07b,
+# ch07d -- at least 15 occurrences, not a small closed set).
+#
+# Implementation note, checked rather than assumed: epub.py's
+# expand_numbers runs at EXTRACTION time, long before normalize_for_tts
+# ever sees the text, and it expands the digit run in place without
+# touching what follows -- "350ships" is already "three hundred and
+# fiftyships" (a WORD glued to a word) by the time this function runs.
+# There is no surviving digit-stage to intercept at speak-time; this
+# operates on the word-glued form that's actually there.
+#
+# False-positive guard: naive "does a number word start this token"
+# matching is dangerous for short, common number-word syllables that are
+# also real English word stems -- "tenant" (ten+ant), "tenor" (ten+or),
+# "oneness" (one+ness), "twofold" (two+fold) would all be wrongly split.
+# _GLUED_NUMBER_HEADS excludes "one", "two", "six", "ten", and "zero" for
+# exactly this reason; none of the confirmed real occurrences need them
+# (they use fifty, eighty, hundred, and nine-via-a-hyphenated-compound).
+# Three glued forms expand_numbers itself produces on purpose are excluded
+# from splitting: a decade plural ("seventies", "eighties" -- the y->ies
+# spelling change means the FULL ten-word is never a literal prefix, but a
+# SHORTER ones-word coincidentally is: "seven" prefixes "seventies",
+# "eight" prefixes "eighties" -- caught explicitly via
+# _DECADE_PLURAL_WORDS, not by the prefix search below); a bare trailing
+# "s" (scale-word plural, "hundreds"/"thousands"); and an ordinal suffix
+# glued straight onto the cardinal ("onest", "twond", "threerd", "fourth",
+# "twenty-onest"). All three are intentional existing behavior, not the
+# missing-space defect this targets.
+_GLUED_NUMBER_HEADS = frozenset(_NUM_WORDS) - {"one", "two", "six", "ten", "zero"} | {
+    "hundred", "thousand"}
+_GLUED_ORDINAL_SUFFIXES = ("st", "nd", "rd", "th")
+_DECADE_PLURAL_WORDS = frozenset({
+    "twenties", "thirties", "forties", "fifties", "sixties", "seventies",
+    "eighties", "nineties",
+})
+_GLUED_TOKEN_RE = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)?")
+
+
+def _split_glued_number(token: str) -> str:
+    """If `token` is a recognized number word (optionally a hyphenated
+    tens-compound like "thirty-nine") immediately fused to more letters,
+    return it with a space inserted; otherwise return `token` unchanged.
+    See the module comment above for the false-positive guard and the
+    three intentionally-glued forms this leaves alone."""
+    if token.lower() in _DECADE_PLURAL_WORDS:
+        return token
+    if "-" in token:
+        head, _, tail = token.partition("-")
+        if head.lower() not in _GLUED_NUMBER_HEADS:
+            return token
+        search_in, prefix = tail, head + "-"
+    else:
+        search_in, prefix = token, ""
+    for i in range(len(search_in), 0, -1):
+        candidate = search_in[:i]
+        if candidate.lower() in _GLUED_NUMBER_HEADS:
+            rest = search_in[i:]
+            if not rest or rest.lower() == "s" or rest.lower() in _GLUED_ORDINAL_SUFFIXES:
+                return token
+            return f"{prefix}{candidate} {rest}"
+    return token
+
+
+def _rewrite_glued_numbers(text: str) -> str:
+    return _GLUED_TOKEN_RE.sub(lambda m: _split_glued_number(m.group(0)), text)
+
+
 def normalize_for_tts(text: str) -> str:
-    """Speak-time-only substitution for three hazards: known publisher-EPUB
-    text defects (_TEXT_DEFECT_FIXES, exact strings), "c." before a number
+    """Speak-time-only substitution for four hazards: known publisher-EPUB
+    text defects (_TEXT_DEFECT_FIXES, exact strings), a number glued to
+    the following word (_rewrite_glued_numbers), "c." before a number
     (_rewrite_circa), and the "Name/War/Part + roman numeral"
     mispronunciation hazard (see module comment above). NEVER changes plan
     identity, chunk ids, or text_sha256 -- callers apply this only at the
@@ -600,6 +671,7 @@ def normalize_for_tts(text: str) -> str:
     fire on the pattern alone.
     """
     text = _fix_text_defects(text)
+    text = _rewrite_glued_numbers(text)
     text = _rewrite_circa(text)
 
     def repl(m):
@@ -3045,6 +3117,52 @@ def selfcheck() -> int:
     check("plain text with no 'c.' is byte-identical",
           normalize_for_tts("A sentence with no abbreviations at all.") ==
           "A sentence with no abbreviations at all.")
+
+    # Glued number+word defect ("350ships", "80per", "600miles", "1739a"):
+    # epub.py's expand_numbers has already turned the digit run into words
+    # by the time this runs ("350ships" -> "three hundred and fiftyships"),
+    # so the fix operates on the word-glued form actually present, not a
+    # surviving digit stage (checked directly -- there isn't one).
+    check("'fiftyships' (from 350ships) becomes 'fifty ships'",
+          normalize_for_tts(
+              "employed some three hundred and fiftyships (Spanish, French, "
+              "Portuguese and English) by the fifteen seventies.") ==
+          "employed some three hundred and fifty ships (Spanish, French, "
+          "Portuguese and English) by the fifteen seventies.")
+    check("'thirty-ninea' (from 1739a) becomes 'thirty-nine a'",
+          normalize_for_tts("In seventeen thirty-ninea huge Mughal army surrendered.") ==
+          "In seventeen thirty-nine a huge Mughal army surrendered.")
+    check("'eightyper' (from 80per) becomes 'eighty per'",
+          normalize_for_tts(
+              "an oil embargo (eightyper cent of Japanese oil came from America)") ==
+          "an oil embargo (eighty per cent of Japanese oil came from America)")
+    check("'hundredmiles' (from 600miles) becomes 'hundred miles'",
+          normalize_for_tts("stretching six hundredmiles across the continent.") ==
+          "stretching six hundred miles across the continent.")
+    check("decade plurals (eighteen eighties, nineteen seventies) are untouched",
+          normalize_for_tts("in the eighteen eighties fashion changed.") ==
+          "in the eighteen eighties fashion changed."
+          and normalize_for_tts("the nineteen seventies arrived.") ==
+          "the nineteen seventies arrived.")
+    check("ordinal-glued forms (onest, twenty-onest, fourth) are untouched",
+          normalize_for_tts("the onest of May arrived.") == "the onest of May arrived."
+          and normalize_for_tts("the twenty-onest century began.") ==
+          "the twenty-onest century began."
+          and normalize_for_tts("the fourth wall broke.") == "the fourth wall broke.")
+    check("false-positive guard: ordinary words starting with a number "
+          "syllable are untouched (tenant, tenor, oneness)",
+          normalize_for_tts("the tenant paid rent.") == "the tenant paid rent."
+          and normalize_for_tts("his tenor voice carried.") == "his tenor voice carried."
+          and normalize_for_tts("a sense of oneness prevailed.") ==
+          "a sense of oneness prevailed.")
+    check("scale-word plurals (hundreds, thousands) are untouched",
+          normalize_for_tts("hundreds of ships sailed.") == "hundreds of ships sailed.")
+    check("plain digits followed by space/punctuation are unaffected",
+          normalize_for_tts("The death of Tamerlane in 1405.") ==
+          "The death of Tamerlane in 1405.")
+    check("a sentence with no digits at all is byte-identical",
+          normalize_for_tts("A sentence with no numbers whatsoever.") ==
+          "A sentence with no numbers whatsoever.")
 
     try:
         import numpy as np  # noqa: F401
