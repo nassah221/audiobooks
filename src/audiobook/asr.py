@@ -67,7 +67,7 @@ from . import epub
 DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 DEFAULT_LANGUAGE = "en"
-VALIDATION_POLICY = "paragraph-v35-phrase-token-alignment"
+VALIDATION_POLICY = "paragraph-v36-ordinal-before-name-guard"
 
 # --- verdict thresholds ------------------------------------------------------
 COVERAGE_MIN = 0.85          # fraction of expected tokens found, in order
@@ -1124,6 +1124,22 @@ def _apply_phrase_pairs(expected: list, asr: list) -> tuple:
     forever. Reading only from the untouched original and advancing past
     whatever was matched makes that impossible -- the scan position is
     monotonic and bounded by len(expected).
+
+    Never rewrites a matched variant that is ALREADY present verbatim in
+    `asr` (v36): the regnal-numeral group's ("the", "1st") pattern is
+    plain token matching with no check on what precedes "the" -- a name,
+    in the actual "Abbas I" -> "Abbas the First" hazard this group exists
+    for, vs. nothing in ordinary prose like "the First World War", which
+    tokenize()'s general ordinal-word rule turns into "the 1st world war"
+    too. Without this guard, a correctly-transcribed "the First World War"
+    (asr already reads "the 1st world war", identical to expected) still
+    matched the ("the", "1st") variant and then found its OWN "1st" one
+    token later via the unscoped alt search -- a self-collision, not
+    independent evidence of a Whisper renormalization -- and rewrote
+    expected down to bare "1st", dropping "the" for no reason and
+    desyncing it from a transcript it already agreed with word-for-word.
+    If source and transcript already match, there's nothing to reconcile,
+    so the untouched variant is always preferred over any alt.
     """
     all_pairs = _TRANSLITERATION_PHRASE_PAIRS + _REGNAL_NUMERAL_PHRASE_PAIRS
     out = []
@@ -1136,6 +1152,8 @@ def _apply_phrase_pairs(expected: list, asr: list) -> tuple:
             for variant in variants:
                 n = len(variant)
                 if tuple(expected[i:i + n]) != variant:
+                    continue
+                if any(tuple(asr[j:j + n]) == variant for j in range(len(asr) - n + 1)):
                     continue
                 for alt in variants:
                     if alt == variant:
@@ -3044,6 +3062,62 @@ def selfcheck() -> int:
     check("Part III becomes Part Three (cardinal exclusion list)",
           normalize_for_tts("Part III covers the aftermath.") ==
           "Part Three covers the aftermath.")
+
+    # v36: "First World War"/"Second World War" (ordinal WORD before the
+    # name, plain correct English) must never be touched, at any stage --
+    # not by normalize_for_tts (it isn't: _REGNAL_NUMERAL_RE only matches a
+    # roman numeral, and "First" isn't one), and not by the phrase-pair
+    # equivalence machinery that runs afterwards at comparison time. Traced
+    # from a live gate failure on ch01:p0031:s0006-0011: source "...came to
+    # a halt with the First World War." validated fine at speak_text (the
+    # regex never fires), but tokenize()'s general ordinal-word ->
+    # digit-ordinal normalization ("first" -> "1st", used for genuine cases
+    # like "the twenty-first" vs. Whisper's "21st") turns the expected
+    # tokens into "...the 1st world war", and _apply_phrase_pairs then
+    # matched _REGNAL_NUMERAL_PHRASE_PAIRS's ("the", "1st") variant --
+    # context-free, since the pattern is just two tokens with no check on
+    # what precedes "the" (a name, in the real regnal hazard, vs. nothing
+    # in ordinary prose) or what follows "1st" (a title-cased name
+    # elsewhere vs. "world war" here). Its alt-search then found "1st"
+    # again in the SAME asr array -- a self-collision with the untouched,
+    # correctly-transcribed word one token further along, not independent
+    # confirming evidence -- and rewrote expected "the 1st" down to bare
+    # "1st", dropping "the" and desyncing it from the transcript's own
+    # "the 1st" for no reason. The fix in _apply_phrase_pairs: never
+    # rewrite a matched variant that is ALREADY present verbatim in asr --
+    # if source and transcript already agree token-for-token, there is
+    # nothing to reconcile, so the untouched-variant case is always tried
+    # before any alt.
+    ww1_source = "The war came to a halt with the First World War."
+    ww1_speak = normalize_for_tts(ww1_source)
+    check("'First World War' (ordinal before name) untouched by normalize_for_tts",
+          ww1_speak == ww1_source, repr(ww1_speak))
+    ww1_exp = tokenize(ww1_speak)
+    check("'the First World War' tokenizes to 'the 1st world war' (ordinary ordinal-word rule)",
+          ww1_exp[-4:] == ["the", "1st", "world", "war"], repr(ww1_exp))
+    for ww1_transcript in (
+        "The war came to a halt with the First World War.",
+        "the war came to a halt with the first world war",
+    ):
+        ww1_asr = tokenize(ww1_transcript)
+        ww1_mand = derive_mandatory(ww1_exp, ww1_speak)
+        ww1_mres = check_mandatory(ww1_asr, ww1_mand)
+        ww1_term = terminal_suffix(ww1_exp, ww1_asr,
+                                   phonetic_matches=ww1_mres["phonetic_matches"])
+        check(f"'First World War' validates end-to-end against {ww1_transcript!r}",
+              ww1_mres["missing"] == [] and ww1_term["matched"]
+              and ww1_term["expected"] == "with the 1st world war",
+              repr((ww1_mres["missing"], ww1_term)))
+    check("'Second World War' (ordinal before name) untouched by normalize_for_tts",
+          normalize_for_tts("News of the Second World War spread quickly.") ==
+          "News of the Second World War spread quickly.")
+    check("World War I still becomes World War One (numeral after the name, unaffected)",
+          normalize_for_tts("World War I began in the summer.") ==
+          "World War One began in the summer.")
+    check("Abbas I regnal rewrite still equates to bare 'I' via phrase pairs",
+          terminal_suffix(tokenize(normalize_for_tts("The rule of Abbas I ended badly.")),
+                          tokenize("The rule of Abbas I ended badly."))["matched"])
+
     # Bare "I" not followed by punctuation now fires too (Elizabeth I
     # constructed -> Elizabeth the First constructed), resolved against a
     # whole-book grep rather than a guess -- see _PRONOUN_CONTEXT_WORDS.
