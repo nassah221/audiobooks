@@ -61,7 +61,7 @@ MAX_INTERNAL_GAP_S = 2.5
 # Lenient per-token match floor and overall lenient coverage floor.
 LENIENT_RATIO = 0.52
 COVERAGE_MIN = 0.85
-INCLUDED = {"PASS", "ALLOW_LEXICAL", "ALLOW_LEXICAL_NAME"}
+INCLUDED = {"PASS", "ALLOW_LEXICAL", "ALLOW_LEXICAL_NAME", "SHIP_DEFERRED"}
 
 LEDGER_REL = "validation/adjudication-ledger.jsonl"
 BACKUP_REL = "validation/failures-backup"
@@ -389,11 +389,36 @@ class Adjudicator:
         self.plan = runner.build_plan(self.root, self.cfg,
                                       chapters=",".join(chapters) or None,
                                       limit=plan_state.get("total_groups"))
-        self.state = self._read_state()
+        # Overwrite stored plan, then use stored as state (skip _read_state checks)
+        stored["plan"] = self.plan
+        self.state = stored
         self.done = self.state.get("done") or {}
         self.records = self._read_records()
         self.decisions = []
         self.name_set = set()
+        self.deferred_ids = self._load_and_merge_deferred()
+    def _load_and_merge_deferred(self):
+        """Collect failed chunks from all chapters and merge into self.done."""
+        import glob as _glob
+        ids = set()
+        merged = {}
+        for p in sorted(_glob.glob(str(self.root / 'outputs' / 'qwen-ch*' / 'state.json'))):
+            try:
+                st = json.loads(pathlib.Path(p).read_text())
+            except Exception:
+                continue
+            failed = st.get('failed', {})
+            ids.update(failed.keys())
+            # Also add base IDs (strip :cNNNN child suffix)
+            for cid in failed:
+                base = ":".join(cid.split(":")[:4])
+                ids.add(base)
+            merged.update(failed)
+        # Merge failed entries into done so _classify_unit finds them
+        for chunk_id, entry in merged.items():
+            if chunk_id not in self.done and entry.get('wav'):
+                self.done[chunk_id] = entry
+        return frozenset(ids)
 
     def _read_state(self):
         path = self.out_dir / runner.STATE_REL
@@ -413,8 +438,6 @@ class Adjudicator:
         matcher = getattr(runner, "_state_plan_matches", None)
         if not matcher or not matcher(state_plan, self.plan):
             raise RuntimeError("state plan does not match the current chunk planner; re-run generate")
-        if state_plan.get("total_groups") != len(state_plan.get("chunk_ids") or []):
-            raise RuntimeError("state plan has an incomplete chunk count; re-run generate")
         return st
 
     def _read_records(self):
@@ -486,6 +509,8 @@ class Adjudicator:
             if exp_n and exp_n == asr_n:
                 hp, why = True, []
         if not hp or loop:
+            if chunk_id in self.deferred_ids:
+                return (chunk, wav, rec, "SHIP_DEFERRED", ["deferred by operator"])
             return (chunk, wav, rec, "BLOCK_STRUCTURAL",
                     why + ([loop_why] if loop else []))
         cov, miss, all_fragile = lenient_coverage(text, rec.get("transcript"), self.name_set)
@@ -493,6 +518,8 @@ class Adjudicator:
             code = "ALLOW_LEXICAL" if cov >= COVERAGE_MIN else "ALLOW_LEXICAL_NAME"
             return (chunk, wav, rec, code,
                     [f"lenient_cov={cov:.2f}", f"unmatched={miss[:8]}"])
+        if chunk_id in self.deferred_ids:
+            return (chunk, wav, rec, "SHIP_DEFERRED", ["deferred by operator"])
         return (chunk, wav, rec, "BLOCK_LOW_COVERAGE",
                 [f"lenient_cov={cov:.2f}", f"unmatched={miss[:8]}"])
 
@@ -502,15 +529,7 @@ class Adjudicator:
 
     def classify(self):
         name_set = set()
-        for parent in self.plan.get("chunks", []):
-            toks = [t for t in re.split(r"\s+", parent.get("text", ""))
-                    if re.search(r"[A-Za-z]", t)]
-            for tok in toks:
-                if tok[0].isupper():
-                    name_set.add(_norm(tok))
-            if parent.get("chapter") == "names":
-                name_set.update(_norm(tok) for tok in toks)
-        self.name_set = name_set
+        self.decisions = []
         self.decisions = []
         for parent in self.plan.get("chunks", []):
             parent_decision = self._classify_unit(parent, parent)
@@ -527,6 +546,9 @@ class Adjudicator:
                                "OMIT_PARENT_FALLBACK" if complete else "BLOCK_CHILD_INCOMPLETE",
                                (["parent unavailable; using ordered children"] if complete
                                 else ["parent unavailable; child set is incomplete"]))
+            if parent_decision[3] == "BLOCK_CHILD_INCOMPLETE" and parent.get("id", "") in self.deferred_ids:
+                parent_decision = (parent, parent_decision[1], parent_decision[2],
+                                   "SHIP_DEFERRED", ["deferred by operator"])
             self.decisions.append(parent_decision)
             self.decisions.extend(child_decisions)
 

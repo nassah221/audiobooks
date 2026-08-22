@@ -44,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("generate", help="resumable generation (sentence-bounded PCM16 checkpoints)")
     p.add_argument("--chapters", help="comma list with ranges, e.g. 1-9,preface,names (default: all)")
+    p.add_argument("--chunk-ids", help="file with exact chunk IDs to generate; never broadens to the chapter")
     p.add_argument("--limit", type=int, help="max sentence chunks (smoke runs)")
     p.add_argument("--offline", action="store_true", help="forbid downloads (fail if cache incomplete)")
     p.add_argument("--force", action="store_true",
@@ -152,13 +153,15 @@ def main(argv=None) -> int:
                 validate=args.validate,
             )
             _print_preflight(rpt)
-            return 0 if rpt["verdict"] == "PASS" else 1
-        elif args.cmd == "generate":
+            ids = None
+            if args.chunk_ids:
+                ids = [x.strip() for x in pathlib.Path(args.chunk_ids).read_text().splitlines() if x.strip()]
             summary = runner.Generator(
                 root, out, chapters=args.chapters, limit=args.limit,
                 force=args.force, discard_done=args.discard_done,
                 resume_from=args.resume_from,
                 offline=True if args.offline else None,
+                chunk_ids=ids,
             ).run()
             print(f"generated {summary['generated']} chunk(s); {summary['done_total']}/"
                   f"{summary['plan']['groups']} done "

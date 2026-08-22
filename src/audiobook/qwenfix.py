@@ -61,8 +61,9 @@ from __future__ import annotations
 
 import re
 
-# Frames generated after the first sampled EOS (80 ms each).
-EOS_HOLD_FRAMES = 6
+# Frames generated after the first sampled EOS (80 ms each). Ten frames retain
+# enough right-context for final sibilants such as the /st/ in "collapsed".
+EOS_HOLD_FRAMES = 10
 # Keep at most this much trailing quiet after the last speech sample.
 TAIL_MAX_SILENCE_SECONDS = 0.24
 # Linear fade applied to the very end of the kept tail.

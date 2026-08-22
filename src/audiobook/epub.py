@@ -431,7 +431,20 @@ def _between_words(text: str, i: int) -> bool:
 
 
 def normalize_paragraph(text: str) -> str:
-    return expand_numbers(normalize_typography(text))
+    text = expand_numbers(normalize_typography(text))
+    replacements = {
+        "sinkiang": "Sinkiang", "new'Turkish": "new Turkish", "Ch'ing": "Qing",
+        "Tz'u-hsi": "Tzu Hsi", "tz'u-hsi": "Tzu Hsi", "haj": "Hajj",
+        "new'local": "new local", "Moscownowaimed": "Moscow now aimed",
+        "Weltpolitik": "world politics", "Bagdadbahn": "Baghdad Bahn", "anti-Ching": "anti Qing",
+        "eastasia": "East Asia", "thepost-war": "the post-war",
+        "EastAsia": "East Asia", "toamass": "to a mass",
+        "thepost": "the post", "tonineteen": "to nineteen",
+        "nowlay": "now lay", "zeromillion": "zero million",
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    return text
 
 
 _ABBREVIATIONS = {

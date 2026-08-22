@@ -809,7 +809,7 @@ class Generator:
 
     def __init__(self, root, out_dir, *, chapters=None, limit=None, force=False,
                  discard_done=False, resume_from=None, offline=None, validate=True,
-                 config=None):
+                 chunk_ids=None, config=None):
         self.root = pathlib.Path(root)
         self.out_dir = pathlib.Path(out_dir)
         self.force = force
@@ -827,6 +827,7 @@ class Generator:
         # that full-regen behavior must NOT apply to a carried-forward set
         # -- carried entries that still validate are done, no TTS call.
         self._mismatch_force_carry = False
+        self.chunk_ids = frozenset(chunk_ids or ())
         self.validate = validate
         self.offline = offline
         self.config = config if config is not None else load_config(self.root)
@@ -1051,25 +1052,19 @@ class Generator:
             del failed[fid]
 
     def _pending_chunks(self):
-        # `force` has two distinct meanings that must not collapse into
-        # one: (1) the state already matched and --force means "regenerate
-        # everything" (the documented, pre-existing behavior -- full
-        # invalidation below); (2) _load_state hit a mismatch and --force
-        # only archived + carried the old done/failed set forward (see
-        # _mismatch_force_carry) -- there, carried entries that still
-        # validate against THIS plan are done, exactly like a normal
-        # resume, and only genuinely new/changed chunks are pending.
-        # getattr guard: minimal test doubles built with
-        # object.__new__(Generator) predate this flag and never set it;
-        # absent means "not a mismatch carry-forward", i.e. plain force.
+        candidates = []
+        if self.chunk_ids:
+            wanted = set(self.chunk_ids)
+            for parent in self.plan["chunks"]:
+                children = self._child_chunks(parent)
+                if parent["id"] in wanted or any(c["id"] in wanted for c in children):
+                    candidates.append(parent)
+            return candidates
         if self.force and not getattr(self, "_mismatch_force_carry", False):
             for parent in self.plan["chunks"]:
                 if parent["id"] not in self._forced_parents:
                     self._invalidate_forced_parent(parent)
             return list(self.plan["chunks"])
-        # Failed chunks are re-selectable, but only AFTER every
-        # never-attempted chunk: a fresh chunk should never wait behind a
-        # retry of something that already burned an attempt budget.
         fresh, retry = [], []
         for chunk in self.plan["chunks"]:
             if self._is_done(chunk):
@@ -1229,6 +1224,7 @@ class Generator:
             "seconds": last.get("seconds") if last else None,
             "terminal_silence_seconds": last.get("terminal_silence_seconds") if last else None,
             "tail_frame_peak": last.get("tail_frame_peak") if last else None,
+            "audio_artifacts": last.get("audio_artifacts") if last else None,
             "failed_policy": asr.VALIDATION_POLICY,
             "failed_unix": time.time(),
         }
@@ -1431,6 +1427,7 @@ class Generator:
         sibilant_frac = qwenfix.final_sibilant_high_frac(
             audio, SAMPLE_RATE, speak_text)
         context_high_frac = qwenfix.speech_high_band_frac(audio, SAMPLE_RATE)
+        audio_artifacts = asr._audio_artifacts(audio, SAMPLE_RATE)
         rel = f"chunks/{chunk['chapter']}/{chunk['id'].replace(':', '-')}.wav"
         wav = self.out_dir / rel
         wav.parent.mkdir(parents=True, exist_ok=True)
@@ -1471,6 +1468,7 @@ class Generator:
             "tail_frame_peak": round(tail_frame_peak, 6),
             "final_sibilant_high_frac": (
                 None if sibilant_frac is None else round(sibilant_frac, 4)),
+            "audio_artifacts": audio_artifacts,
             "context_high_frac": round(context_high_frac, 6),
             "seconds": facts["seconds"], "generation_seconds": round(gen_seconds, 4),
             "model": {"repo": self.config.model_repo, "revision": self.config.model_revision},
