@@ -18,6 +18,9 @@ scripts/
 # Alternate transcripts are unneeded; only the canonical phrase-bounded.txt is tracked
 references/bragg/alternates/
 
+# Local notes; only tracked docs are committed
+docs/*.md
+
 # Copyrighted inputs and generated audio stay local — never committed
 *.epub
 *.wav
