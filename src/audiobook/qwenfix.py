@@ -17,15 +17,15 @@ Three defects clip or degrade the final word's release:
    model never generated.
 
 ``generate_icl_tail_safe`` replaces ``model.generate`` for this pipeline.
-It is a vendored copy of ``_generate_icl``'s sampling loop with EOS-hold:
-when the model first samples EOS, the step is resampled with EOS
-suppressed and generation continues for ``EOS_HOLD_FRAMES`` more frames.
-Measured on truncated and complete takes, the held frames decode to the
-model's own room tone, which (a) supplies the right-context that restores
-the trimmed release and (b) ends every chunk in take-specific natural
-silence instead of a repeated pad motif (an earlier fixed room-tone pad
-produced an audible stutter at every chunk end). Decoding is done here
-with exact trims, bypassing the valid-length bug.
+It is a vendored copy of ``_generate_icl``'s sampling loop with EOS
+replacement: when the model first samples EOS, that step is resampled with
+EOS suppressed. The one replacement frame supplies decoder right-context
+without the five additional continuation frames previously used: in a
+shared-code blind comparison across eight unseen stratified texts, the
+replacement-only decode preserved every terminal word, passed 8/8 objective
+gates versus 7/8, and was preferred 3/8 with five ties; the longer tail alone
+introduced all three audible artifacts. Decoding is done here with exact
+trims, bypassing the valid-length bug.
 
 Rolling context: Qwen3-TTS ICL cloning works by feeding "text the speaker
 already said" plus its codec frames, then unspoken target text, and
@@ -61,8 +61,9 @@ from __future__ import annotations
 
 import re
 
-# Frames generated after the first sampled EOS (80 ms each).
-EOS_HOLD_FRAMES = 6
+# Continuation frames including the replacement sampled at the EOS step.
+# One means replacement-only: zero subsequent held frames.
+EOS_HOLD_FRAMES = 1
 # Keep at most this much trailing quiet after the last speech sample.
 TAIL_MAX_SILENCE_SECONDS = 0.24
 # Linear fade applied to the very end of the kept tail.

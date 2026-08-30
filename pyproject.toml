@@ -9,6 +9,8 @@ dependencies = [
     "mlx-audio==0.4.8",
     "mlx-whisper==0.4.3",
     "numpy==2.5.2",
+    "onnxruntime==1.23.2",
+    "pyloudnorm==0.2.0",
     "soundfile==0.14.0",
 ]
 

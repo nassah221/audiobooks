@@ -83,10 +83,14 @@ CLAUSE_SPLIT_POLICY = "planned-strong-clause-v1"
 # chain, so v3 (icl-nocontext-v3) turns rolling context off entirely via
 # ROLLING_CONTEXT_ENABLED: every chunk generates from the Bragg reference
 # alone, the same context-free path a paragraph-start chunk always used.
+# v4 (icl-nocontext-eos-replacement-v4) keeps context disabled and changes
+# EOS continuation from replacement+5 frames to replacement-only after a
+# shared-code unseen-text blind comparison: 3/8 preferred v4, 5 ties, all
+# terminal words complete, and all three audible artifacts were in v3 tails.
 # The v1/v2 machinery (_rolling_context_for, _context_decision,
 # _accept_rolling, qwenfix's context-splicing) stays in the code, gated
 # off, in case a future fix makes rolling context viable again.
-GENERATION_POLICY = "icl-nocontext-v3"
+GENERATION_POLICY = "icl-nocontext-eos-replacement-v4"
 
 # Master switch for rolling-context conditioning (see GENERATION_POLICY
 # lineage above). False: every chunk's generation call gets context=None,
@@ -3067,9 +3071,10 @@ def selfcheck() -> int:
     policy_gen._record_chunk(new_take)
     check("a freshly generated chunk records the current generation policy",
           policy_gen.done[new_take["id"]]["generation_policy"] == GENERATION_POLICY)
-    check("generation policy reverted to context-free generation "
-          "(icl-nocontext-v3), rolling context off by default",
-          GENERATION_POLICY == "icl-nocontext-v3" and ROLLING_CONTEXT_ENABLED is False)
+    check("generation policy uses context-free replacement-only EOS handling",
+          GENERATION_POLICY == "icl-nocontext-eos-replacement-v4"
+          and qwenfix.EOS_HOLD_FRAMES == 1
+          and ROLLING_CONTEXT_ENABLED is False)
 
     # A chunk generated before this field existed (a real done entry from
     # outputs/qwen-book-v2, generated under "icl-rolling-v1") has no

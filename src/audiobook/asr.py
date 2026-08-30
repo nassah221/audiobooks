@@ -116,6 +116,15 @@ _ORDINAL_WORD_RE = re.compile(
 )
 _NUMERIC_RANGE_RE = re.compile(r"(?<![a-z0-9])(\d+)-(\d+)(?![a-z0-9])")
 _DECIMAL_RE = re.compile(r"(?<![a-z0-9])(\d+)\.(\d+)(?![a-z0-9])")
+# Non-decomposing Latin letters: NFKD cannot split these -- they are atomic
+# letters (ø is "o with stroke", not o + a combining slash), so they need
+# explicit ASCII spellings. Symmetric fold applied after NFKD (text is
+# already lowercased by then), so the accented and plain-ASCII spellings of
+# a name agree in either direction, like the NFKD fold above.
+_NON_DECOMPOSING_LATIN = str.maketrans({
+    "æ": "ae", "ø": "o", "ð": "d", "þ": "th", "ß": "ss", "œ": "oe",
+    "ł": "l", "ı": "i", "đ": "d", "ħ": "h", "ŋ": "n", "ŧ": "t", "ĸ": "k",
+})
 _NUMERIC_ORDINAL_RE = re.compile(r"(?<![a-z0-9])(\d+)(?:st|nd|rd|th)(?![a-z0-9])")
 _DECADE_SUFFIXES = {
     "twenties": "20", "thirties": "30", "forties": "40", "fifties": "50",
@@ -360,6 +369,10 @@ def _tokenize_pre_merge(text: str) -> list:
     # token, and vice versa, regardless of which side has the accent.
     t = "".join(ch for ch in unicodedata.normalize("NFKD", t)
                 if not unicodedata.combining(ch))
+    # NFKD alone leaves the atomic Latin letters above intact, and the
+    # ASCII-only allowlist regex below would then delete them outright
+    # ("Søren" -> "sren"); fold them to their ASCII spellings first.
+    t = t.translate(_NON_DECOMPOSING_LATIN)
     t = _DECIMAL_RE.sub(r"\1 point \2", t)
     t = _NUMERIC_RANGE_RE.sub(r"\1 to \2", t)
     t = _DECADE_NUMERIC_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}s", t)
@@ -495,20 +508,20 @@ _REGNAL_NUMERAL_RE = re.compile(
     r"\b([A-Z][a-zA-Z]*)\s+(I|II|III|IV|V|VI|VII|VIII|IX|X)\b([.,;:]?)"
 )
 
-# Publisher-EPUB text defects: exact known-bad strings, fixed at speak-time
-# only. "entrepô t" / "entrepoô t" (a stray space splitting "entrepôt" into
-# two tokens) is a genuine typo in the source EPUB HTML itself, not an
-# artifact of our extraction -- confirmed directly in
-# extracted/OEBPS/html/ch02d.html etc., 9 occurrences across chapters 2-6
-# (chapter 1 is clean). The durable fix is correcting extraction so the
-# text itself is right, but that changes text_sha256/plan identity for
-# every affected paragraph, so it must happen only at a full-book
-# regeneration boundary, never mid-run (the same trap as the --chapters
-# incident earlier this session). These are exact string replacements,
-# not a pattern -- two specific known-bad strings, not a general class.
+# Publisher-EPUB/extraction text defects, fixed at speak-time only. These are
+# exact observed strings, not general rewrite rules. Besides the split
+# "entrepôt" forms, ch03 loses a footnote boundary after 1600 and collapses
+# "1600[fn 111] — one reason" to "sixteen hundred one reason". Restoring
+# a sentence boundary preserves the two semantic units and gives narration
+# a strong pause cue; it is not generic pause-token injection.
+#
+# The durable fix is correcting extraction, but that changes plan identity
+# mid-run. Speak-time repair keeps existing chunk IDs/text hashes stable and
+# is applied symmetrically to generation and ASR expected text.
 _TEXT_DEFECT_FIXES = {
     "entrepô t": "entrepôt",
     "entrepoô t": "entrepôt",
+    "sixteen hundred one reason why": "sixteen hundred. One reason why",
 }
 
 
@@ -769,10 +782,19 @@ def _source_punctuation_boundaries(source: str) -> list:
     prev_sentence_end_index = -1
     for chunk_match in re.finditer(r"\S+", source):
         chunk = chunk_match.group(0)
+        if chunk == "—":
+            preceding = tokenize(source[:chunk_match.start()])
+            if preceding:
+                boundaries.append({
+                    "kind": "colon_semicolon",
+                    "punctuation": "—",
+                    "expected_token_index": len(preceding) - 1,
+                })
+            continue
         chunk_tokens = tokenize(chunk)
         if not chunk_tokens:
             continue
-        for punctuation in re.finditer(r"[.?!:;,]+", chunk):
+        for punctuation in re.finditer(r"[.?!:;,—]+", chunk):
             mark = punctuation.group(0)
             before = chunk[:punctuation.start()]
             preceding = tokenize(source[:chunk_match.start()] + before)
@@ -787,7 +809,7 @@ def _source_punctuation_boundaries(source: str) -> list:
                 if _is_sentence_abbreviation(chunk[:punctuation.end()]):
                     continue
                 kind = "sentence_end"
-            elif mark[0] in ":;":
+            elif mark[0] in ":;—":
                 kind = "colon_semicolon"
             elif mark[0] == "," and before.endswith(")"):
                 kind = "parenthetical_comma"
@@ -1103,8 +1125,12 @@ def _find_transliteration_match(word: str, asr: list) -> str:
 # recurring across the colonial chapters) transcribed as "Estado de
 # India" -- Whisper reducing the Portuguese /dɐ/ in "da" to "de", a vowel
 # distinction in a foreign monosyllable embedded in an English sentence.
+# K'ang-hsi/Kangxi is the established Wade-Giles/Pinyin spelling pair;
+# garbled Kang C/Si renderings remain human-adjudicated, never aliases.
 _TRANSLITERATION_PHRASE_PAIRS = (
     (("estado", "da", "india"), ("estado", "de", "india")),
+    (("k'ang", "hsi"), ("kangxi",)),
+    (("k'ang", "hsi's"), ("kangxi's",)),
 )
 
 
@@ -1484,6 +1510,8 @@ def check_mandatory(asr: list, mandatory: list, ratio: float = MANDATORY_FUZZY_R
         if not phrase:
             continue
         label = item if isinstance(item, str) else " ".join(map(str, item))
+        phrase, phrase_pairs = _apply_phrase_pairs(phrase, asr)
+        transliteration_matches.update(phrase_pairs)
         items.append(label)
         if _phrase_in(asr, phrase, ratio):
             if len(phrase) == 1 and phrase[0].isalpha():
@@ -2275,6 +2303,11 @@ def selfcheck() -> int:
     check("umlaut folds to plain ASCII", tokenize("Müller") == ["muller"])
     check("accent folding is symmetric (accented transcript, plain source)",
           tokenize("Rio de la Plata") == tokenize("Río de la Plata"))
+    check("Søren folds like Soren (NFKD alone misses ø: it is an atomic "
+          "letter -- o with a stroke, not o + a combining mark)",
+          tokenize("Søren") == tokenize("Soren") == ["soren"])
+    check("ordinary decomposing accents still fold alongside the "
+          "non-decomposing table", tokenize("Émile") == ["emile"])
     check("punctuation is still stripped after accent folding",
           tokenize("Café, naïve—résumé!") == ["cafe", "naive", "resume"])
     check("digits and apostrophes still handled as before",
@@ -2756,6 +2789,28 @@ def selfcheck() -> int:
           cracow_mandatory["missing"] == [] and
           cracow_mandatory["transliteration_matches"].get("cracow") == "krakow",
           repr(cracow_mandatory))
+    expected_kangxi, kangxi_pairs = _apply_phrase_pairs(
+        tokenize("K'ang-hsi ruled."), tokenize("Kangxi ruled."))
+    check("K'ang-hsi matches modern Kangxi transliteration as a phrase",
+          ordered_coverage(expected_kangxi, tokenize("Kangxi ruled."))["fraction"] == 1.0
+          and terminal_suffix(expected_kangxi, tokenize("Kangxi ruled."))["matched"] is True
+          and kangxi_pairs.get("k'ang hsi") == "kangxi")
+    expected_possessive, possessive_pairs = _apply_phrase_pairs(
+        tokenize("K'ang-hsi's rule."), tokenize("Kangxi's rule."))
+    check("possessive K'ang-hsi's matches Kangxi's as a phrase",
+          ordered_coverage(expected_possessive, tokenize("Kangxi's rule."))["fraction"] == 1.0
+          and terminal_suffix(expected_possessive, tokenize("Kangxi's rule."))["matched"] is True
+          and possessive_pairs.get("k'ang hsi's") == "kangxi's")
+    absent_kangxi, absent_pairs = _apply_phrase_pairs(
+        tokenize("K'ang-hsi ruled."), tokenize("The emperor ruled."))
+    kangxi_mandatory = check_mandatory(
+        tokenize("Kangxi's successors ruled."), ["k'ang hsi's"])
+    check("mandatory phrase gate accepts possessive Kangxi alias",
+          kangxi_mandatory["missing"] == []
+          and kangxi_mandatory["transliteration_matches"].get(
+              "k'ang hsi's") == "kangxi's")
+    check("K'ang-hsi phrase alias never tolerates an absent name",
+          absent_kangxi == tokenize("K'ang-hsi ruled.") and not absent_pairs)
     check("an unrelated word is not a curated transliteration pair",
           not _is_transliteration_pair("koran", "random") and
           not _tok_eq("koran", "random", MANDATORY_FUZZY_RATIO))
@@ -3166,6 +3221,13 @@ def selfcheck() -> int:
     check("text without the defect is byte-identical",
           normalize_for_tts("The death of Tamerlane in 1405.") ==
           "The death of Tamerlane in 1405.")
+    check("lost 1600 footnote boundary is restored without changing words",
+          normalize_for_tts(
+              "silver by sixteen hundred one reason why Europeans traded.") ==
+          "silver by sixteen hundred. One reason why Europeans traded.")
+    check("unrelated number prose is unchanged",
+          normalize_for_tts("sixteen hundred ships arrived.") ==
+          "sixteen hundred ships arrived.")
 
     # "c." before a number reads as "circa" (both glued and spaced forms,
     # one pattern) -- forensics on three already-generated chapter-1 takes
@@ -3177,6 +3239,36 @@ def selfcheck() -> int:
     check("glued 'c.1750' (as expand_numbers renders it) becomes 'circa seventeen fifty'",
           normalize_for_tts("South China after c.seventeen fifty.") ==
           "South China after circa seventeen fifty.")
+    footnote_sentence = (
+        "By some estimates Japan produced silver by sixteen hundred. "
+        "One reason why Europeans traded there.")
+    footnote_tokens = tokenize(footnote_sentence)
+    boundary_after_index = _source_punctuation_boundaries(footnote_sentence)[0]["expected_token_index"]
+
+    def footnote_timings(boundary_gap):
+        timings = []
+        cursor = 0.0
+        for i, token in enumerate(footnote_tokens):
+            if i == boundary_after_index + 1:
+                cursor += boundary_gap
+            timings.append({"text": token, "start": cursor, "end": cursor + 0.2})
+            cursor += 0.2
+        return timings
+
+    repaired_boundary = punctuation_metrics(
+        footnote_sentence, footnote_timings(0.2))
+    sentence_break = repaired_boundary["boundaries"][0]
+    check("restored footnote boundary passes a measured sentence pause",
+          sentence_break["punctuation"] == "."
+          and sentence_break["gap_s"] == 0.2
+          and sentence_break["passed"] is True)
+    short_boundary = punctuation_metrics(
+        footnote_sentence, footnote_timings(0.05))
+    short_break = short_boundary["boundaries"][0]
+    check("restored footnote boundary rejects a sub-100ms pause",
+          short_break["punctuation"] == "."
+          and short_break["gap_s"] == 0.05
+          and short_break["passed"] is False)
     check("spaced 'c. 1870' (as expand_numbers renders it) becomes 'circa eighteen seventy'",
           normalize_for_tts("After c. eighteen seventy fear spread.") ==
           "After circa eighteen seventy fear spread.")
