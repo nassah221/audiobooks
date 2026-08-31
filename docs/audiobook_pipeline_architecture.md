@@ -24,7 +24,7 @@ M4B packaging
 
 ## Text and planning
 
-`epub.py` extracts chapter text and keeps paragraph boundaries. It groups complete sentences toward 70 words with an 85-word ceiling. Long or repeatedly failing chunks can fall back to planned clause children; assembly uses a parent only when it passes, otherwise it requires the complete child set.
+`epub.py` excludes XHTML metadata, preserves chapter titles and section headings as dedicated typed units in document order, and keeps prose paragraph boundaries. It groups complete sentences toward 70 words with an 85-word ceiling. Long or repeatedly failing chunks can fall back to planned clause children; assembly uses a parent only when it passes, otherwise it requires the complete child set.
 
 `normalize_for_tts` performs narrow speak-time repairs without changing plan IDs or source-text hashes. Current repairs cover known number forms, regnal numerals, abbreviations, glued words, publisher defects, and the lost footnote boundary after “sixteen hundred.” The same spoken text is used as the ASR expectation.
 

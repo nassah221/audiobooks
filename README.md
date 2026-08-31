@@ -2,7 +2,7 @@
 
 This project turns an EPUB and a short voice reference into a validated, chaptered audiobook on Apple Silicon.
 
-The current pipeline uses Qwen3-TTS for voice-cloned speech and Whisper for validation. It plans paragraph-bounded chunks, checkpoints every accepted WAV, resumes interrupted runs, records failures instead of hiding them, and refuses assembly until the selected audio is complete.
+The current pipeline uses Qwen3-TTS for voice-cloned speech and Whisper for validation. It plans chapter titles and section headings as dedicated units alongside paragraph-bounded prose chunks, checkpoints every accepted WAV, resumes interrupted runs, records failures instead of hiding them, and refuses assembly until the selected audio is complete.
 
 ## Requirements
 
@@ -175,7 +175,7 @@ config.py → epub.py → runner.py → qwenfix.py
 ```
 
 - `config.py` loads and verifies configured inputs.
-- `epub.py` extracts chapters and builds paragraph-bounded plans.
+- `epub.py` extracts chapter titles, section headings, and paragraph-bounded prose.
 - `runner.py` manages generation, validation, retries, state, and assembly.
 - `qwenfix.py` owns Qwen sampling and exact codec-frame decoding.
 - `asr.py` normalizes spoken text and validates generated takes.

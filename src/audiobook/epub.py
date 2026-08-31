@@ -67,7 +67,7 @@ SENTENCE_GROUP_POLICY = "paragraph-sentences-clauses"
 SENTENCE_GROUP_VERSION = 2
 SENTENCE_GROUP_LIMITS = {"target_words": 70, "max_words": 85}
 BLOCK_TAGS = {"p", "div", "li", "td", "th", "blockquote", "dd", "dt"}
-SKIP_TAGS = {"script", "style", "sup"}  # sup: footnote markers only (verified all-numeric)
+SKIP_TAGS = {"head", "script", "style", "sup"}  # sup: numeric footnote markers
 HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 VOID_TAGS = frozenset(
     {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
@@ -146,9 +146,8 @@ def read_spine(epub_path):
 
 
 class _TextExtractor(HTMLParser):
-    """Collects block paragraphs from one chapter file, dropping footnote
-    sup markers, page-number references, headings (captured separately),
-    and any script/style content."""
+    """Collect prose blocks and ordered headings separately, excluding XHTML
+    metadata, footnote markers, and script/style content."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -158,6 +157,8 @@ class _TextExtractor(HTMLParser):
         self._heading = False
         self._heading_buf = []
         self._first_heading = None
+        self._headings = []
+        self._heading_tag = None
 
     def _flush_para(self):
         txt = re.sub(r"\s+", " ", "".join(self._para)).strip()
@@ -172,8 +173,12 @@ class _TextExtractor(HTMLParser):
         txt = re.sub(r"\s+", " ", "".join(self._heading_buf)).strip()
         self._heading_buf = []
         self._heading = False
-        if txt and self._first_heading is None:
-            self._first_heading = txt
+        if txt:
+            self._headings.append({"before_paragraph": len(self._paras),
+                                   "text": txt})
+            if self._first_heading is None:
+                self._first_heading = txt
+        self._heading_tag = None
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -189,6 +194,7 @@ class _TextExtractor(HTMLParser):
             self._flush_para()
             self._stack.append(("heading", tag))
             self._heading = True
+            self._heading_tag = tag
         elif tag in BLOCK_TAGS:
             self._flush_para()
             self._stack.append(None)
@@ -239,7 +245,7 @@ def _file_paragraphs(z: zipfile.ZipFile, member: str):
     parser = _TextExtractor()
     parser.feed(z.read(member).decode("utf-8"))
     parser.close()
-    return parser._paras, parser._first_heading
+    return parser._paras, parser._first_heading, parser._headings
 
 
 # ---------------------------------------------------------------------------
@@ -253,17 +259,22 @@ def _continues(prev: str, nxt: str) -> bool:
     return not re.search(r"[.!?][\"'\u2019\u201d)\]]*$", prev) and nxt[:1].islower()
 
 
+
+
 def _merge_files(file_paras):
     merged = []
-    for paras, _ in file_paras:
-        if not paras:
-            continue
-        if merged and _continues(merged[-1], paras[0]):
+    headings = []
+    for paras, _, file_headings in file_paras:
+        continuation = bool(paras and merged and _continues(merged[-1], paras[0]))
+        base = len(merged) - (1 if continuation else 0)
+        headings.extend({"before_paragraph": base + h["before_paragraph"],
+                         "text": h["text"]} for h in file_headings)
+        if continuation:
             merged[-1] += " " + paras[0]
             merged.extend(paras[1:])
         else:
             merged.extend(paras)
-    return merged
+    return merged, headings
 
 
 class _Chapters(dict):
@@ -286,15 +297,17 @@ def chapter_paragraphs(epub_path):
         by_chapter[chapter].append(member)
     with zipfile.ZipFile(epub_path) as z:
         titles = {}
+        headings = {}
         out = _Chapters()
         for chapter in order:
             members = by_chapter[chapter]
             file_paras = [_file_paragraphs(z, m) for m in members]
-            first = next((h for paras, h in file_paras if paras), None)
+            first = next((h for paras, h, _ in file_paras if h), None)
             if first:
                 titles[chapter] = first
-            out[chapter] = _merge_files(file_paras)
+            out[chapter], headings[chapter] = _merge_files(file_paras)
     out.attrs["titles"] = titles
+    out.attrs["headings"] = headings
     return out
 
 
@@ -431,6 +444,8 @@ def _between_words(text: str, i: int) -> bool:
 
 
 def normalize_paragraph(text: str) -> str:
+    text = text.replace("THE LONG SIXTEENTH CENTURYIN EAST ASIA",
+                        "THE LONG SIXTEENTH CENTURY IN EAST ASIA")
     return expand_numbers(normalize_typography(text))
 
 
@@ -600,16 +615,25 @@ def sentence_chunks(text: str, max_words: int = 85) -> list[dict]:
 
 
 def extract_chapters(epub_path):
-    """[{'id', 'title', 'paragraphs': [...]}] in spine order."""
+    """Return chapters with stable prose paragraphs and positioned headings."""
     paras_by_chapter = chapter_paragraphs(epub_path)
     titles = paras_by_chapter.attrs["titles"]  # type: ignore[attr-defined]
+    headings = paras_by_chapter.attrs["headings"]  # type: ignore[attr-defined]
     chapters = []
     for chapter_id, paras in paras_by_chapter.items():
-        paragraphs = [text for p in paras if (text := normalize_paragraph(p))]
-        chapters.append(
-            {"id": chapter_id, "title": titles.get(chapter_id, chapter_id),
-             "paragraphs": paragraphs}
-        )
+        normalized = [normalize_paragraph(p) for p in paras]
+        kept_before = [0]
+        for text in normalized:
+            kept_before.append(kept_before[-1] + bool(text))
+        paragraphs = [text for text in normalized if text]
+        chapter_headings = [
+            {"before_paragraph": kept_before[h["before_paragraph"]],
+             "kind": "chapter-title" if i == 0 else "section-heading",
+             "text": normalize_paragraph(h["text"])}
+            for i, h in enumerate(headings[chapter_id])
+        ]
+        chapters.append({"id": chapter_id, "title": titles.get(chapter_id, chapter_id),
+                         "paragraphs": paragraphs, "headings": chapter_headings})
     return chapters
 
 
@@ -630,6 +654,10 @@ def _frozen_book_checks(chapters):
         print(f"  {'ok ' if cond else 'FAIL'} {name}")
 
     check("title is heading text only (ch02)", by_id["ch02"]["title"] == "2 Eurasia and the Age of Discovery")
+    check("chapter title precedes first prose paragraph (ch02)",
+          by_id["ch02"]["headings"][0] ==
+          {"before_paragraph": 0, "kind": "chapter-title",
+           "text": "two Eurasia and the Age of Discovery"})
     check("title is heading text only (ch01)", by_id["ch01"]["title"] == "1 Orientations")
     check("title is heading text only (ch09)", by_id["ch09"]["title"] == "9 Tamerlane’s Shadow")
     # ch02's first prose paragraph sits right after the <h2> + <img/>; it used
@@ -698,14 +726,16 @@ def selfcheck() -> int:
     check("merge continuation", _continues("he said", "quietly") is True
           and _continues("He stopped.", "Then he ran") is False)
 
-    # A heading containing a self-closing <br/> must stay one heading: the V
-    # void end tag used to pop the heading off the stack, so </h2> couldn't
-    # close it and the following body leaked into the title.
     _br = _TextExtractor()
-    _br.feed("<h2>Title<br/>Line two</h2><p>Opening prose.</p>")
+    _br.feed("<head><title>Book metadata</title></head><h2>Title<br/>Line two</h2>"
+             "<p>Opening prose.</p><h3>Section</h3><p>More.</p>")
     _br.close()
-    check("heading intact across <br/>",
-          _br._first_heading == "Title Line two" and _br._paras == ["Opening prose."])
+    check("head metadata skipped; headings positioned separately",
+          _br._first_heading == "Title Line two"
+          and _br._paras == ["Opening prose.", "More."]
+          and _br._headings == [
+              {"before_paragraph": 0, "text": "Title Line two"},
+              {"before_paragraph": 1, "text": "Section"}])
     long_tail = "one two three four five six seven eight"
     for mark, label in ((":", "colon"), (";", "semicolon"), ("—", "em dash")):
         sample = long_tail + mark + " " + long_tail + "."
@@ -722,7 +752,8 @@ def selfcheck() -> int:
     _bra.feed("<h2>A<br/>B</h2><p class=\"image\"><img src=\"x\"/></p><p>Body one.</p>")
     _bra.close()
     check("self-closing img doesn't drop paragraph",
-          _bra._first_heading == "A B" and _bra._paras == ["Body one."])
+          _bra._first_heading == "A B" and _bra._paras == ["Body one."]
+          and _bra._headings == [{"before_paragraph": 0, "text": "A B"}])
     failed = [name for name, ok in results if not ok]
     print(f"selfcheck: {len(results) - len(failed)}/{len(results)} passed")
     return 1 if failed else 0

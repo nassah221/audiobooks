@@ -522,6 +522,7 @@ _TEXT_DEFECT_FIXES = {
     "entrepô t": "entrepôt",
     "entrepoô t": "entrepôt",
     "sixteen hundred one reason why": "sixteen hundred. One reason why",
+    "COMPARING EUROPE": "Comparing Europe",
 }
 
 
@@ -655,33 +656,12 @@ def _rewrite_glued_numbers(text: str) -> str:
 
 
 def normalize_for_tts(text: str) -> str:
-    """Speak-time-only substitution for four hazards: known publisher-EPUB
-    text defects (_TEXT_DEFECT_FIXES, exact strings), a number glued to
-    the following word (_rewrite_glued_numbers), "c." before a number
-    (_rewrite_circa), and the "Name/War/Part + roman numeral"
-    mispronunciation hazard (see module comment above). NEVER changes plan
-    identity, chunk ids, or text_sha256 -- callers apply this only at the
-    point text is handed to the TTS, and symmetrically as the ASR
-    comparison's expected text (that is what was actually spoken); the
-    chunk's own `text` field stays the untouched original everywhere else
-    (plan hashing, `derive_mandatory`, state.json).
+    """Apply exact text repairs, number repairs, circa expansion, and Roman
+    numeral readings at synthesis time. The heading repair changes casing
+    only: Qwen repeatedly slurred all-caps ``COMPARING`` as ``compring``.
 
-    Two readings of "Word + roman numeral":
-    - Regnal ordinal (default): "Abbas I" -> "Abbas the First", "Suleiman
-      II" -> "Suleiman the Second".
-    - Cardinal count, when the preceding word is in the fixed exclusion
-      list (_CARDINAL_CONTEXT_WORDS): "World War II" -> "World War Two",
-      "Part III" -> "Part Three" -- English reads these as counts, not
-      regnal ordinals.
-
-    "I" specifically fires when followed by punctuation (comma/period/
-    semicolon/colon) OR a lowercase word ("Elizabeth I constructed" ->
-    "Elizabeth the First constructed"), UNLESS the preceding word is in
-    _PRONOUN_CONTEXT_WORDS -- a bare "I" collides with the first-person
-    pronoun, and a whole-book grep found exactly one word where that
-    collision actually occurs ("Thus I have used..."), so that is the only
-    exclusion; nothing else is guessed at. II-X have no such collision and
-    fire on the pattern alone.
+    NEVER changes plan identity, chunk ids, or text_sha256. Callers apply this
+    only when handing text to TTS and as the symmetric ASR comparison target.
     """
     text = _fix_text_defects(text)
     text = _rewrite_glued_numbers(text)
@@ -3221,6 +3201,8 @@ def selfcheck() -> int:
     check("text without the defect is byte-identical",
           normalize_for_tts("The death of Tamerlane in 1405.") ==
           "The death of Tamerlane in 1405.")
+    check("all-caps Comparing Europe gets stable speak-time casing",
+          normalize_for_tts("COMPARING EUROPE") == "Comparing Europe")
     check("lost 1600 footnote boundary is restored without changing words",
           normalize_for_tts(
               "silver by sixteen hundred one reason why Europeans traded.") ==

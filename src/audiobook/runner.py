@@ -461,7 +461,7 @@ def parse_chapters(spec, chapter_ids) -> list:
     return [c for c in ids if c in wanted]
 
 def build_plan(root, config=None, chapters=None, limit=None) -> dict:
-    """Build deterministic paragraph-bounded sentence and clause groups."""
+    """Build stable prose chunks plus separately identified heading units."""
     root = pathlib.Path(root)
     cfg = config if config is not None else load_config(root)
     book = root / cfg.book
@@ -476,36 +476,56 @@ def build_plan(root, config=None, chapters=None, limit=None) -> dict:
     chunks = []
     source_paragraphs = 0
     chapter_group_counts = {}
+
+    def append_group(c, text, paragraph_index, spans, group, chunk_id):
+        sentence_indexes = list(group["sentence_indexes"])
+        clause_spans = [dict(span) for span in group["clause_spans"]]
+        chunks.append({
+            "chapter": c["id"], "paragraph_index": paragraph_index,
+            "idx": len(chunks), "id": chunk_id,
+            "sentence_span": list(group["sentence_span"]),
+            "sentence_indexes": sentence_indexes,
+            "sentence_count": int(group["sentence_count"]),
+            "sentence_spans": [dict(spans[k]) for k in sentence_indexes],
+            "clause_indexes": [list(index) for index in group["clause_indexes"]],
+            "clause_count": int(group["clause_count"]),
+            "clause_spans": clause_spans,
+            "eligible_clause_spans": [dict(span) for span in clause_spans],
+            "source_span": [int(group["start"]), int(group["end"])],
+            "word_count": int(group["words"]), "text": group["text"],
+            "text_sha256": group["text_sha256"],
+            "paragraph_sha256": sha256_text(text),
+        })
+        chapter_group_counts[c["id"]] += 1
+
+    def append_heading(c, heading, heading_index):
+        text = heading["text"]
+        spans = epub.sentence_spans(text)
+        groups = epub.group_sentences(text, spans)
+        for part, group in enumerate(groups):
+            suffix = "" if len(groups) == 1 else f":g{part:04d}"
+            append_group(c, text, f"heading-{heading_index:04d}", spans, group,
+                         f"{c['id']}:h{heading_index:04d}{suffix}")
+            chunks[-1]["heading_kind"] = heading["kind"]
+
     for c in selected:
         chapter_group_counts[c["id"]] = 0
         source_paragraphs += len(c["paragraphs"])
+        headings_at = {}
+        for heading_index, heading in enumerate(c.get("headings", [])):
+            headings_at.setdefault(heading["before_paragraph"], []).append(
+                (heading_index, heading))
         for paragraph_index, text in enumerate(c["paragraphs"]):
+            for heading_index, heading in headings_at.get(paragraph_index, []):
+                append_heading(c, heading, heading_index)
             spans = epub.sentence_spans(text)
             for group in epub.group_sentences(text, spans):
-                sentence_indexes = list(group["sentence_indexes"])
-                clause_indexes = [list(index) for index in group["clause_indexes"]]
-                clause_spans = [dict(span) for span in group["clause_spans"]]
-                chunk = {
-                    "chapter": c["id"], "paragraph_index": paragraph_index,
-                    "idx": len(chunks),
-                    "id": (f"{c['id']}:p{paragraph_index:04d}:"
-                           f"s{group['sentence_span'][0]:04d}-{group['sentence_span'][1]:04d}:"
-                           f"o{int(group['start']):06d}-{int(group['end']):06d}"),
-                    "sentence_span": list(group["sentence_span"]),
-                    "sentence_indexes": sentence_indexes,
-                    "sentence_count": int(group["sentence_count"]),
-                    "sentence_spans": [dict(spans[k]) for k in sentence_indexes],
-                    "clause_indexes": clause_indexes,
-                    "clause_count": int(group["clause_count"]),
-                    "clause_spans": clause_spans,
-                    "eligible_clause_spans": [dict(span) for span in clause_spans],
-                    "source_span": [int(group["start"]), int(group["end"])],
-                    "word_count": int(group["words"]), "text": group["text"],
-                    "text_sha256": group["text_sha256"],
-                    "paragraph_sha256": sha256_text(text),
-                }
-                chunks.append(chunk)
-                chapter_group_counts[c["id"]] += 1
+                append_group(c, text, paragraph_index, spans, group,
+                             f"{c['id']}:p{paragraph_index:04d}:"
+                             f"s{group['sentence_span'][0]:04d}-{group['sentence_span'][1]:04d}:"
+                             f"o{int(group['start']):06d}-{int(group['end']):06d}")
+        for heading_index, heading in headings_at.get(len(c["paragraphs"]), []):
+            append_heading(c, heading, heading_index)
     if limit is not None:
         if limit < 0:
             raise RunError(f"limit must be >= 0, got {limit}")
@@ -2377,26 +2397,36 @@ def selfcheck() -> int:
 
     original_extract = epub.extract_chapters
     epub.extract_chapters = lambda _: [
-        {"id": "ch01", "title": "One", "paragraphs": ["First. Second.", "Third."]},
-        {"id": "ch02", "title": "Two", "paragraphs": ["Second chapter."]},
-        {"id": "ch03", "title": "Three", "paragraphs": ["Third chapter."]},
+        {"id": "ch01", "title": "One", "paragraphs": ["First. Second.", "Third."],
+         "headings": [{"before_paragraph": 0, "kind": "chapter-title", "text": "One"}]},
+        {"id": "ch02", "title": "Two", "paragraphs": ["Second chapter."],
+         "headings": [{"before_paragraph": 0, "kind": "chapter-title", "text": "Two"},
+                      {"before_paragraph": 0, "kind": "section-heading", "text": "Section"}]},
+        {"id": "ch03", "title": "Three", "paragraphs": ["Third chapter."],
+         "headings": [{"before_paragraph": 0, "kind": "chapter-title", "text": "Three"}]},
     ]
     try:
         paragraph_plan = build_plan(_root, _base)
         suffix_plan = _plan_for_resume(_root, _base, resume_from="ch02")
         check("resume suffix selects chapters before plan identity",
               [c["id"] for c in suffix_plan["chapters"]] == ["ch02", "ch03"]
-              and [c["chapter"] for c in suffix_plan["chunks"]] == ["ch02", "ch03"])
+              and [c["chapter"] for c in suffix_plan["chunks"]] ==
+              ["ch02", "ch02", "ch02", "ch03", "ch03"])
         check("resume suffix rejects chapter absent from selected set",
               _raises(RunError, lambda: _plan_for_resume(
                   _root, _base, chapters="ch01", resume_from="ch02")))
     finally:
         epub.extract_chapters = original_extract
-    check("plan preserves paragraph provenance and exact text",
+    check("plan preserves typed title/section ordering and exact text",
           [c["text"] for c in paragraph_plan["chunks"]] ==
-          ["First. Second.", "Third.", "Second chapter.", "Third chapter."]
+          ["One", "First. Second.", "Third.", "Two", "Section",
+           "Second chapter.", "Three", "Third chapter."]
+          and [(c.get("heading_kind"), c["id"]) for c in paragraph_plan["chunks"]
+               if c.get("heading_kind")] ==
+          [("chapter-title", "ch01:h0000"), ("chapter-title", "ch02:h0000"),
+           ("section-heading", "ch02:h0001"), ("chapter-title", "ch03:h0000")]
           and paragraph_plan["total_paragraphs"] == 4
-          and paragraph_plan["total_groups"] == 4
+          and paragraph_plan["total_groups"] == 8
           and paragraph_plan["chapters"][0]["paragraphs"] == 2)
     target_paragraphs = [
         "one two three four five six seven eight nine ten (eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen), nineteen twenty twenty-one twenty-two twenty-three twenty-four twenty-five.",
