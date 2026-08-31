@@ -158,7 +158,6 @@ class _TextExtractor(HTMLParser):
         self._heading_buf = []
         self._first_heading = None
         self._headings = []
-        self._heading_tag = None
 
     def _flush_para(self):
         txt = re.sub(r"\s+", " ", "".join(self._para)).strip()
@@ -178,7 +177,6 @@ class _TextExtractor(HTMLParser):
                                    "text": txt})
             if self._first_heading is None:
                 self._first_heading = txt
-        self._heading_tag = None
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -194,7 +192,6 @@ class _TextExtractor(HTMLParser):
             self._flush_para()
             self._stack.append(("heading", tag))
             self._heading = True
-            self._heading_tag = tag
         elif tag in BLOCK_TAGS:
             self._flush_para()
             self._stack.append(None)
