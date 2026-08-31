@@ -523,6 +523,8 @@ _TEXT_DEFECT_FIXES = {
     "entrepoô t": "entrepôt",
     "sixteen hundred one reason why": "sixteen hundred. One reason why",
     "COMPARING EUROPE": "Comparing Europe",
+    "THE OCCIDENTAL BREAKOUT": "The Occidental Breakout",
+    "THE LONG SIXTEENTH CENTURY IN EAST ASIA": "The Long Sixteenth Century in East Asia",
 }
 
 
@@ -3203,6 +3205,10 @@ def selfcheck() -> int:
           "The death of Tamerlane in 1405.")
     check("all-caps Comparing Europe gets stable speak-time casing",
           normalize_for_tts("COMPARING EUROPE") == "Comparing Europe")
+    check("all-caps heading pronunciation gets stable speak-time casing",
+          normalize_for_tts("THE OCCIDENTAL BREAKOUT") == "The Occidental Breakout"
+          and normalize_for_tts("THE LONG SIXTEENTH CENTURY IN EAST ASIA") ==
+          "The Long Sixteenth Century in East Asia")
     check("lost 1600 footnote boundary is restored without changing words",
           normalize_for_tts(
               "silver by sixteen hundred one reason why Europeans traded.") ==
